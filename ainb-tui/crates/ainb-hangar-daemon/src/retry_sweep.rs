@@ -785,6 +785,69 @@ mod tests {
         );
     }
 
+    /// Current database authority wins over an earlier roster snapshot. This
+    /// fails with the legacy unconditional recording route before transport.
+    #[tokio::test]
+    async fn qualification_current_cap_denies_a_stale_roster_send() {
+        let (_dir, store) = store().await;
+        let (_broker, sink) = broker();
+        seed_err(&store, "claude:cap-change", "/work/cap-change", OVERLOADED).await;
+        let mut snapshot = AtcInstanceRepo::get(store.pool(), SWEEP_INSTANCE).await.unwrap().unwrap();
+        snapshot.err_retry_cap = 100;
+        AtcInstanceRepo::record_continue(store.pool(), SWEEP_INSTANCE, "claude:cap-change", NOW).await.unwrap();
+        sqlx::query("UPDATE atc_instance SET err_retry_cap = 1 WHERE name = ?")
+            .bind(SWEEP_INSTANCE).execute(store.pool()).await.unwrap();
+        let session = FleetRepo::get_session(store.pool(), "claude:cap-change").await.unwrap().unwrap();
+        let mut report = SweepReport::default();
+        enforce_cap(store.pool(), &sink, &snapshot, &session, "overloaded", NOW, &mut report).await;
+        assert_eq!(report.continued, 0, "stale roster cannot grant another unit");
+        assert_eq!(ledger(&store, "claude:cap-change").await, Some(1));
+        assert!(FleetRepo::list_action_receipts(store.pool(), 10).await.unwrap().is_empty(), "denied admission must never enter transport");
+    }
+
+    #[tokio::test]
+    async fn qualification_concurrent_sweeps_bound_the_actual_send_route() {
+        let (_dir, store) = store().await;
+        let (_broker, sink) = broker();
+        seed_err(&store, "claude:concurrent-cap", "/work/concurrent-cap", OVERLOADED).await;
+        sqlx::query("UPDATE atc_instance SET err_retry_cap = 2 WHERE name = ?")
+            .bind(SWEEP_INSTANCE).execute(store.pool()).await.unwrap();
+        let mut snapshot = AtcInstanceRepo::get(store.pool(), SWEEP_INSTANCE).await.unwrap().unwrap();
+        snapshot.err_retry_cap = 100;
+        let session = FleetRepo::get_session(store.pool(), "claude:concurrent-cap").await.unwrap().unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(20));
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let pool = store.pool().clone();
+            let sink = sink.clone();
+            let snapshot = snapshot.clone();
+            let session = session.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut report = SweepReport::default();
+                enforce_cap(&pool, &sink, &snapshot, &session, "overloaded", NOW, &mut report).await;
+                report
+            }));
+        }
+        let mut admitted = 0;
+        let mut rejected = 0;
+        for handle in handles {
+            let report = handle.await.unwrap();
+            admitted += report.continued;
+            rejected += report.send_failed;
+        }
+        assert_eq!(admitted, 2);
+        assert_eq!(rejected, 2, "capability-less fixture retains failed-send units");
+        assert_eq!(ledger(&store, "claude:concurrent-cap").await, Some(2));
+        let receipts = FleetRepo::list_action_receipts(store.pool(), 100).await.unwrap();
+        assert_eq!(receipts.len(), 2, "only admitted units reach the actual action seam");
+        for unit in [1, 2] {
+            let id = format!("retry-sweep:claude:concurrent-cap:{}:{unit}", session.version);
+            assert!(receipts.iter().any(|receipt| receipt.request_id == id && receipt.status == "REJECTED"));
+        }
+    }
+
     /// A transient ERR under the cap spends one unit of budget and dispatches
     /// `continue` through the one verified send path.
     #[tokio::test]
