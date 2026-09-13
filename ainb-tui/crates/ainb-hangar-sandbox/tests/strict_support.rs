@@ -584,6 +584,7 @@ print('strict-alternate-paths-verified')
                 for line in stdout.lines().filter(|line| {
                     line.starts_with(PROOF)
                         || line.starts_with("RESOURCE_NATIVE ")
+                        || line.starts_with("RESOURCE_ABI ")
                         || line.starts_with("RESOURCE_OBSERVER ")
                 }) {
                     println!("\n{line}");
@@ -726,8 +727,20 @@ libc.prlimit64.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(Limit), ct
 libc.prlimit64.restype = ctypes.c_int
 self_limit = Limit()
 assert libc.prlimit64(0, resource.RLIMIT_NOFILE, None, ctypes.byref(self_limit)) == 0, 'self query failed'
-pid, soft, hard = map(int, sys.argv[1:])
+pid, soft, hard, syscall_number = map(int, sys.argv[1:])
 assert pid > 1 and pid != os.getpid() and soft >= 64
+# Use explicitly full-width variadic syscall arguments: prlimit64's c_int
+# wrapper would discard the high word before seccomp could observe it.
+libc.syscall.restype = ctypes.c_long
+for label, argument in [('self', 1 << 32), ('peer', (1 << 32) | pid)]:
+    queried = Limit()
+    ctypes.set_errno(0)
+    queried_result = libc.syscall(ctypes.c_long(syscall_number), ctypes.c_uint64(argument),
+                                  ctypes.c_int(resource.RLIMIT_NOFILE), ctypes.c_void_p(),
+                                  ctypes.byref(queried))
+    queried_error = ctypes.get_errno()
+    returned = (queried.soft, queried.hard) if queried_result == 0 else ('unavailable', 'unavailable')
+    print('RESOURCE_ABI', label, argument, queried_result, queried_error, *returned, flush=True)
 replacement = Limit(soft - 1, hard)
 old = Limit()
 ctypes.set_errno(0)
@@ -742,6 +755,7 @@ print('RESOURCE_NATIVE', os.getpid(), *os.getresuid(), *os.getresgid(), self_lim
                 target.0.id().to_string(),
                 before.0.to_string(),
                 before.1.to_string(),
+                libc::SYS_prlimit64.to_string(),
             ];
             let output = if index == 0 {
                 Command::new("/usr/bin/python3")
@@ -764,7 +778,13 @@ print('RESOURCE_NATIVE', os.getpid(), *os.getresuid(), *os.getresgid(), self_lim
                 String::from_utf8_lossy(&output.stderr)
             );
             let stdout = String::from_utf8(output.stdout).unwrap();
-            let fields: Vec<_> = stdout.split_whitespace().collect();
+            let lines: Vec<_> = stdout.lines().collect();
+            assert_eq!(
+                lines.len(),
+                3,
+                "two ABI queries and one mutation observation"
+            );
+            let fields: Vec<_> = lines[2].split_whitespace().collect();
             assert_eq!(fields.len(), 17, "native probe observation shape");
             assert_eq!(fields[0], "RESOURCE_NATIVE");
             assert_eq!(&fields[14..], &["caps=zero", "ambient=zero", "self=usable"]);
@@ -786,6 +806,38 @@ print('RESOURCE_NATIVE', os.getpid(), *os.getresuid(), *os.getresgid(), self_lim
                 after.1
             );
             assert!(alive, "owned target must remain alive");
+            for (line, label, argument) in [
+                (lines[0], "self", 1_u64 << 32),
+                (lines[1], "peer", (1_u64 << 32) | u64::from(target.0.id())),
+            ] {
+                let abi: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(abi.len(), 7, "full-width query observation shape");
+                assert_eq!(&abi[..2], &["RESOURCE_ABI", label]);
+                assert_eq!(abi[2].parse::<u64>().unwrap(), argument);
+                if label == "self" || index == 0 {
+                    assert_eq!(&abi[3..5], &["0", "0"], "ABI positive must succeed");
+                    let queried = (
+                        abi[5].parse::<u64>().unwrap(),
+                        abi[6].parse::<u64>().unwrap(),
+                    );
+                    let expected = if label == "self" {
+                        (
+                            u64::try_from(values[7]).unwrap(),
+                            u64::try_from(values[8]).unwrap(),
+                        )
+                    } else {
+                        before
+                    };
+                    assert_eq!(
+                        queried, expected,
+                        "query must return the actual prior limits"
+                    );
+                } else {
+                    assert_eq!(abi[3], "-1");
+                    assert_eq!(abi[4].parse::<i32>().unwrap(), libc::EPERM);
+                    assert_eq!(&abi[5..], &["unavailable", "unavailable"]);
+                }
+            }
             if index == 0 {
                 assert_eq!(
                     (values[9], values[10]),
@@ -807,7 +859,7 @@ print('RESOURCE_NATIVE', os.getpid(), *os.getresuid(), *os.getresgid(), self_lim
             }
         }
         println!(
-            "\n{PROOF} namespace={} uid={} gid={} positive=soft-lowered-one hard=unchanged strict=EPERM targets=alive self=usable",
+            "\n{PROOF} namespace={} uid={} gid={} positive=soft-lowered-one hard=unchanged strict=EPERM targets=alive self=usable highword_self=usable highword_peer_positive=queried highword_peer_strict=EPERM",
             namespace.display(),
             uids[0],
             gids[0]

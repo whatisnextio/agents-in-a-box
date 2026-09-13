@@ -156,6 +156,14 @@ fn network_filter() -> Vec<libc::sock_filter> {
     filter.push(jump(JUMP_BITS_SET, NEW_NAMESPACES, 0, 1));
     filter.push(statement(RETURN, DENY));
     filter.push(statement(LOAD_WORD_ABS, 0));
+    // prlimit64 narrows argument zero to pid_t. Only its canonical pid-zero
+    // self form is allowed; explicit numeric self PIDs and peers are denied.
+    // Both supported audit ABIs are little-endian, so byte 16 is the low word.
+    filter.push(jump(EQUAL, libc::SYS_prlimit64 as u32, 0, 4));
+    filter.push(statement(LOAD_WORD_ABS, 16));
+    filter.push(jump(EQUAL, 0, 1, 0));
+    filter.push(statement(RETURN, DENY));
+    filter.push(statement(LOAD_WORD_ABS, 0));
     // Async descriptor owners/signals are kernel signal-routing authority:
     // blocking kill(2) alone does not prevent fasync from signalling another
     // same-UID process. Compare the command's low word, as the kernel does.
