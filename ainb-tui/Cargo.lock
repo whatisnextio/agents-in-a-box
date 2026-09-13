@@ -430,6 +430,7 @@ name = "ainb-hangar-sandbox"
 version = "0.1.0"
 dependencies = [
  "landlock",
+ "libc",
  "tempfile",
  "thiserror 1.0.69",
 ]

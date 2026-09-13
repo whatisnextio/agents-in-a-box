@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 # kernels degrade to `Enforcement::None` (the test SKIPs, never silently
 # "sandboxes" nothing).
 landlock = "0.4"
+libc = "0.2"
 
 [dev-dependencies]
 # Tempdirs for the confinement integration test (allowed workdir vs. a secret

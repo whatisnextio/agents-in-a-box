@@ -51,7 +51,7 @@ use ainb_hangar_store::repo::task::{Task, TaskRepo};
 use ainb_hangar_store::service::claim::{ClaimTaskService, ClaimedTask};
 use ainb_hangar_store::service::complete::{CompleteParams, CompleteTaskService};
 use ainb_hangar_store::service::fail::FailTaskService;
-use ainb_hangar_store::service::finalize::FinalizeError;
+use ainb_hangar_store::service::finalize::{FinalizeError, FinalizeOutcome};
 use ainb_hangar_store::service::pull::PullService;
 use ainb_hangar_store::service::retry::{RetryDecision, RetryService};
 use ainb_hangar_store::service::start::StartTaskService;
@@ -1164,6 +1164,33 @@ async fn execute_claimed(
     let task: Task = TaskRepo::get_by_id(pool, &claimed.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("claimed task {} vanished", claimed.id))?;
+    let execution_epoch = claimed.execution_epoch;
+    let strict_support = claimed.execution_limit.is_some();
+    if task.execution_epoch != execution_epoch {
+        tracing::info!(task_id = %task.id, execution_epoch, "stale claim rejected before setup");
+        return Ok(());
+    }
+    if strict_support
+        && (task.issue_id.is_some()
+            || task.repo_ref.is_some()
+            || task.autopilot_run_id.is_some()
+            || task.squad_id.is_some()
+            || task.mode != "headless")
+    {
+        let refusal = anyhow::anyhow!(
+            "strict local-result task cannot use issue/repo/autopilot/squad/interactive effects"
+        );
+        return finalize_setup_failure(
+            pool,
+            &task,
+            execution_epoch,
+            &refusal,
+            clock,
+            stats,
+            events,
+        )
+        .await;
+    }
     // Pre-run setup faults (slug lookup / execenv prep / F5 provision below) must
     // TERMINALISE the still-`dispatched` task as failed rather than propagate: a
     // propagated setup error left the row `dispatched`, and the stale-dispatch
@@ -1173,12 +1200,23 @@ async fn execute_claimed(
     // `finalize_setup_failure`.
     let ws_slug = match workspace_slug(pool, &task.workspace_id).await {
         Ok(s) => s,
-        Err(e) => return finalize_setup_failure(pool, &task, &e, clock, stats, events).await,
+        Err(e) => {
+            return finalize_setup_failure(pool, &task, execution_epoch, &e, clock, stats, events)
+                .await;
+        }
     };
     let home = hangar_home();
-    let env = match prepare_env(&task, &ws_slug, &home, clock) {
+    let env_result = if strict_support {
+        crate::execenv::prepare_env_for_execution(&task, &ws_slug, &home, execution_epoch, clock)
+    } else {
+        prepare_env(&task, &ws_slug, &home, clock)
+    };
+    let env = match env_result {
         Ok(env) => env,
-        Err(e) => return finalize_setup_failure(pool, &task, &e, clock, stats, events).await,
+        Err(e) => {
+            return finalize_setup_failure(pool, &task, execution_epoch, &e, clock, stats, events)
+                .await;
+        }
     };
 
     // e38.21 + gap #7: materialise ONE `CLAUDE.md` in the task's execenv carrying
@@ -1245,6 +1283,21 @@ async fn execute_claimed(
         }
     };
 
+    if strict_support && dispatch.executor != TaskExecutor::Process {
+        let refusal =
+            anyhow::anyhow!("strict local-result task requires the confined process executor");
+        return finalize_setup_failure(
+            pool,
+            &task,
+            execution_epoch,
+            &refusal,
+            clock,
+            stats,
+            events,
+        )
+        .await;
+    }
+
     // An `interactive` task under the ACP executor is REFUSED, never silently
     // run headless. There is no attachable pane on the ACP path: the axis
     // there is the adapter's `permission_mode` (`default` asks and a human
@@ -1267,7 +1320,16 @@ async fn execute_claimed(
              process executor, or use the adapter's permission_mode for human-in-the-loop \
              under acp"
         );
-        return finalize_setup_failure(pool, &task, &refusal, clock, stats, events).await;
+        return finalize_setup_failure(
+            pool,
+            &task,
+            execution_epoch,
+            &refusal,
+            clock,
+            stats,
+            events,
+        )
+        .await;
     }
 
     // F5: provision the run's working directory from the card's `repo_ref`.
@@ -1320,7 +1382,10 @@ async fn execute_claimed(
         // failed with the real error instead of propagating — the propagate path
         // left it `dispatched` to be reclaimed + re-dispatched into the same fault
         // forever, invisible to the board/detail.
-        Err(e) => return finalize_setup_failure(pool, &task, &e, clock, stats, events).await,
+        Err(e) => {
+            return finalize_setup_failure(pool, &task, execution_epoch, &e, clock, stats, events)
+                .await;
+        }
     };
     let location = run_location_for(&run_wd);
     tracing::info!(task_id = %task.id, cwd = %run_wd.path().display(), "run workdir provisioned");
@@ -1345,7 +1410,7 @@ async fn execute_claimed(
     // advances first: a `dispatched -> running` edge is legal, so this only fails
     // if the loop is driven out of order (a logic bug), never on a real run.
     lifecycle.fire(crate::fsm::LifecycleEvent::Start)?;
-    match StartTaskService::start(pool, &task.id, clock).await {
+    match StartTaskService::start_owned(pool, &task.id, execution_epoch, clock).await {
         Ok(_) => {}
         // tcp T3 / F6: a cancel landed BEFORE the run could start (the RPC flipped
         // the row `{queued|dispatched} -> cancelled`, winning the finalize race).
@@ -1356,6 +1421,10 @@ async fn execute_claimed(
             ..
         }) => {
             tracing::info!(task_id = %task.id, "cancelled before start; tearing down without running");
+            teardown_workdir(&run_wd, &task.id);
+            return Ok(());
+        }
+        Err(FinalizeError::StaleExecution { .. }) | Err(FinalizeError::OwnershipRevoked { .. }) => {
             teardown_workdir(&run_wd, &task.id);
             return Ok(());
         }
@@ -1445,6 +1514,7 @@ async fn execute_claimed(
             finalize_failure(
                 pool,
                 &task,
+                execution_epoch,
                 &run_wd,
                 &env,
                 ainb_hangar_store::service::fail::FailureReason::SpawnTimeout,
@@ -1490,7 +1560,12 @@ async fn execute_claimed(
     // this task's id + workspace) on the runner the claim loop already clones
     // per run, NOT on the daemon-wide `RunnerConfig`. The interactive arm below
     // takes the same value and ignores it: that path captures no stdout.
-    let runner = &runner.with_task_stream(&task.workspace_id, &task.id, events);
+    let selected_runner = if strict_support {
+        runner.with_strict_support()
+    } else {
+        runner.clone()
+    };
+    let runner = &selected_runner.with_task_stream(&task.workspace_id, &task.id, events);
     let provider_run = async {
         if executor == TaskExecutor::Acp {
             // Move 1: no argv, no tmux, no provider subprocess of ours. The
@@ -1637,13 +1712,34 @@ async fn execute_claimed(
         RunOutcome::Success(result) => {
             // running -> done: type the terminal edge before the store finalize.
             lifecycle.fire(crate::fsm::LifecycleEvent::Complete)?;
-            finalize_success(pool, &task, &run_wd, result, provider, clock, stats, events).await?;
+            finalize_success(
+                pool,
+                &task,
+                execution_epoch,
+                &run_wd,
+                result,
+                provider,
+                clock,
+                stats,
+                events,
+            )
+            .await?;
         }
         RunOutcome::Failed { reason, result } => {
             // running -> failed: type the terminal edge before the store finalize.
             lifecycle.fire(crate::fsm::LifecycleEvent::Fail)?;
             finalize_failure(
-                pool, &task, &run_wd, &env, reason, result, provider, clock, stats, events,
+                pool,
+                &task,
+                execution_epoch,
+                &run_wd,
+                &env,
+                reason,
+                result,
+                provider,
+                clock,
+                stats,
+                events,
             )
             .await?;
         }
@@ -1653,7 +1749,16 @@ async fn execute_claimed(
             // the card auto-move; this seam only reclaims the run's artifacts.
             // Type the edge first so an out-of-order cancel is a typed error.
             lifecycle.fire(crate::fsm::LifecycleEvent::Cancel)?;
-            finalize_cancelled(pool, &task, &run_wd, result, provider, clock).await?;
+            finalize_cancelled(
+                pool,
+                &task,
+                execution_epoch,
+                &run_wd,
+                result,
+                provider,
+                clock,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1836,6 +1941,7 @@ async fn run_interactive(
 async fn finalize_success(
     pool: &SqlitePool,
     task: &Task,
+    execution_epoch: i64,
     run_wd: &crate::workdir_provision::RunWorkdir,
     result: crate::runner::RunnerResult,
     provider: &str,
@@ -1863,9 +1969,10 @@ async fn finalize_success(
         ainb_hangar_core::result::TaskResult::new(result.stdout_tail, result.exit_code, pr_url);
     let result_json =
         serde_json::to_value(&task_result).unwrap_or_else(|_| serde_json::json!({"content": ""}));
-    match CompleteTaskService::complete(
+    match CompleteTaskService::complete_owned(
         pool,
         &task.id,
+        execution_epoch,
         CompleteParams {
             result: result_json,
             session_id: result.session_id,
@@ -1877,7 +1984,11 @@ async fn finalize_success(
     )
     .await
     {
-        Ok(_) => {}
+        Ok(FinalizeOutcome::Transitioned) => {}
+        Ok(FinalizeOutcome::AlreadyTerminal) | Err(FinalizeError::StaleExecution { .. }) | Err(FinalizeError::OwnershipRevoked { .. }) => {
+            teardown_workdir(run_wd, &task.id);
+            return Ok(());
+        }
         // tcp T3 / F6: a human cancel (`running -> cancelled`) landed between the
         // provider finishing and this finalize (the cancel RPC won the conditional
         // finalize race). Cancelled wins — skip the success side-effects (the
@@ -1889,6 +2000,10 @@ async fn finalize_success(
             ..
         }) => {
             tracing::info!(task_id = %task.id, "run completed but was cancelled first; honoring cancel");
+            if task.execution_limit.is_some() {
+                teardown_workdir(run_wd, &task.id);
+                return Ok(());
+            }
             // Reclaim the run's artifacts as the cancelled seam would (branch +
             // run-history + teardown), so a race-lost natural finish keeps the
             // same observability a cleanly-cancelled run gets.
@@ -1907,6 +2022,11 @@ async fn finalize_success(
             return Ok(());
         }
         Err(e) => return Err(e.into()),
+    }
+    if task.execution_limit.is_some() {
+        // The selected contract publishes only the guarded durable result.
+        teardown_workdir(run_wd, &task.id);
+        return Ok(());
     }
     // e38.35: record this run's token/cost usage now the task row is terminal
     // (best-effort; a run that reported no usage records nothing).
@@ -2047,6 +2167,7 @@ fn keep_failed_runs() -> bool {
 async fn finalize_failure(
     pool: &SqlitePool,
     task: &Task,
+    execution_epoch: i64,
     run_wd: &crate::workdir_provision::RunWorkdir,
     env: &crate::execenv::ExecEnv,
     reason: ainb_hangar_store::service::fail::FailureReason,
@@ -2058,7 +2179,6 @@ async fn finalize_failure(
 ) -> anyhow::Result<()> {
     // Persist the session id (if any) before failing so a retry can resume the
     // provider conversation.
-    persist_session_id(pool, &task.id, result.session_id.as_deref()).await?;
     // Persist a diagnostic into the `result` column (in the TaskResult
     // `{"content": ...}` shape the detail surface renders) on EVERY failure, so a
     // crash is diagnosable from stored evidence alone. The bare `fail` path left
@@ -2077,10 +2197,21 @@ async fn finalize_failure(
         &result.stdout_tail,
         &result.stderr_tail,
     );
-    let fail_outcome =
-        FailTaskService::fail_with_detail(pool, &task.id, reason, &detail, clock).await;
+    let fail_outcome = FailTaskService::fail_with_detail_owned(
+        pool,
+        &task.id,
+        execution_epoch,
+        reason,
+        &detail,
+        clock,
+    )
+    .await;
     match fail_outcome {
-        Ok(_) => {}
+        Ok(FinalizeOutcome::Transitioned) => {}
+        Ok(FinalizeOutcome::AlreadyTerminal) | Err(FinalizeError::StaleExecution { .. }) | Err(FinalizeError::OwnershipRevoked { .. }) => {
+            teardown_workdir(run_wd, &task.id);
+            return Ok(());
+        }
         // tcp T3 / F6: a human cancel (`running -> cancelled`) beat this failure to
         // the conditional finalize. Cancelled wins — skip the failure side-effects
         // (event / auto-move / retry are the cancel RPC's / not wanted for a
@@ -2091,6 +2222,10 @@ async fn finalize_failure(
             ..
         }) => {
             tracing::info!(task_id = %task.id, "run failed but was cancelled first; honoring cancel");
+            if task.execution_limit.is_some() {
+                teardown_workdir(run_wd, &task.id);
+                return Ok(());
+            }
             // Reclaim artifacts as the cancelled seam does (branch + run-history +
             // teardown) so a race-lost natural finish keeps the same observability.
             persist_run_branch(pool, &task.id, run_wd).await;
@@ -2109,6 +2244,12 @@ async fn finalize_failure(
         }
         Err(e) => return Err(e.into()),
     }
+    if task.execution_limit.is_some() {
+        teardown_workdir(run_wd, &task.id);
+        maybe_spawn_retry(pool, &task.id, clock).await;
+        return Ok(());
+    }
+    persist_session_id(pool, &task.id, result.session_id.as_deref()).await?;
     // e38.35: a failed/timed-out run can still report partial usage worth
     // accounting; record it now the row is terminal (best-effort).
     persist_usage(pool, task, result.usage.as_ref(), clock).await;
@@ -2230,6 +2371,7 @@ async fn finalize_failure(
 async fn finalize_setup_failure(
     pool: &SqlitePool,
     task: &Task,
+    execution_epoch: i64,
     // `Send + Sync` so the enclosing claim-loop future stays `Send` across the
     // `.await`s below (a bare `&dyn Display` would make it un-spawnable).
     error: &(dyn std::fmt::Display + Send + Sync),
@@ -2241,8 +2383,20 @@ async fn finalize_setup_failure(
     let reason = FailureReason::ProvisionError;
     let message = format!("run setup failed before the agent started: {error}");
     tracing::error!(task_id = %task.id, error = %error, "task setup failed before run; failing task");
-    match FailTaskService::fail_setup(pool, &task.id, reason, &message, clock).await {
-        Ok(_) => {}
+    match FailTaskService::fail_setup_owned(
+        pool,
+        &task.id,
+        execution_epoch,
+        reason,
+        &message,
+        clock,
+    )
+    .await
+    {
+        Ok(FinalizeOutcome::Transitioned) => {}
+        Ok(FinalizeOutcome::AlreadyTerminal) | Err(FinalizeError::StaleExecution { .. }) | Err(FinalizeError::OwnershipRevoked { .. }) => {
+            return Ok(());
+        }
         // A human cancel won the row first (`dispatched -> cancelled`). Honour it:
         // skip the failure side-effects and do not log a benign race as an error.
         Err(FinalizeError::TerminalMismatch {
@@ -2258,6 +2412,9 @@ async fn finalize_setup_failure(
             tracing::warn!(task_id = %task.id, error = %e, "could not terminalize setup failure; leaving to sweeper backstop");
             return Ok(());
         }
+    }
+    if task.execution_limit.is_some() {
+        return Ok(());
     }
     // The row is terminal: record the outcome, push the terminal event, and
     // auto-move the card so the board and detail surface the failure (the whole
@@ -2312,11 +2469,18 @@ async fn finalize_setup_failure(
 async fn finalize_cancelled(
     pool: &SqlitePool,
     task: &Task,
+    execution_epoch: i64,
     run_wd: &crate::workdir_provision::RunWorkdir,
     result: crate::runner::RunnerResult,
     provider: &str,
     clock: &dyn HangarClock,
 ) -> anyhow::Result<()> {
+    if task.execution_limit.is_some() {
+        // Cancellation is controller-owned; this worker only tears down its own epoch.
+        teardown_workdir(run_wd, &task.id);
+        return Ok(());
+    }
+    let _ = execution_epoch;
     // A cancelled run that still committed leaves a durable branch — record it so
     // the card can surface the partial work (mirrors the failed path).
     persist_run_branch(pool, &task.id, run_wd).await;
@@ -4094,6 +4258,7 @@ mod tests {
         finalize_failure(
             pool,
             &task,
+            task.execution_epoch,
             &run_wd,
             &env,
             ainb_hangar_store::service::fail::FailureReason::AgentError,

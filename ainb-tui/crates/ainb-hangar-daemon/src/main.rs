@@ -37,8 +37,17 @@ enum Command {
     Beads(BeadsCli),
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    if let Some(code) = ainb_hangar_daemon::support_supervisor::dispatch_if_requested() {
+        std::process::exit(code);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // P8.1/P8.2: install the observability subscriber BEFORE any service
     // constructs so every span/event from boot onwards is captured. `install`
     // returns a `Guard` owning the non-blocking appender's worker (held for the

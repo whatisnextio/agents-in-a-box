@@ -32,7 +32,10 @@
 //! [`signal`]: CancelRegistry::signal
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +52,7 @@ pub fn registry() -> &'static CancelRegistry {
 /// on, so a cancel RPC on another task can stop it.
 #[derive(Default)]
 pub struct CancelRegistry {
-    inner: Mutex<HashMap<String, CancellationToken>>,
+    inner: Arc<Mutex<HashMap<(String, u64), CancellationToken>>>,
 }
 
 impl CancelRegistry {
@@ -58,16 +61,19 @@ impl CancelRegistry {
     /// (every exit path — normal finish, cancel, or panic-unwind), so the map
     /// stays bounded to genuinely-live runs.
     ///
-    /// A pre-existing entry for the id (impossible with unique ULIDs, but
-    /// defended) is replaced, never duplicated.
+    /// Reclaims can overlap execution epochs. Each live registration remains
+    /// distinct, so an older guard cannot erase its successor's cancellation.
     pub fn register(&self, task_id: &str) -> RunCancelGuard {
         let token = CancellationToken::new();
+        let registration = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
+        let key = (task_id.to_string(), registration);
         if let Ok(mut map) = self.inner.lock() {
-            map.insert(task_id.to_string(), token.clone());
+            map.insert(key.clone(), token.clone());
         }
         RunCancelGuard {
-            task_id: task_id.to_string(),
+            key,
             token,
+            inner: Arc::clone(&self.inner),
         }
     }
 
@@ -82,13 +88,14 @@ impl CancelRegistry {
         let Ok(map) = self.inner.lock() else {
             return false;
         };
-        match map.get(task_id) {
-            Some(token) => {
+        let mut signalled = false;
+        for ((id, _), token) in map.iter() {
+            if id == task_id {
                 token.cancel();
-                true
+                signalled = true;
             }
-            None => false,
         }
+        signalled
     }
 
     /// Whether `task_id` has a live registered run IN THIS PROCESS. The worktree
@@ -98,15 +105,7 @@ impl CancelRegistry {
     /// uncertainty, treat the run as live (never delete what might be running).
     #[must_use]
     pub fn is_live(&self, task_id: &str) -> bool {
-        self.inner.lock().map_or(true, |map| map.contains_key(task_id))
-    }
-
-    /// Remove `task_id`'s entry (the guard's drop path). A poisoned lock leaves
-    /// the entry — a bounded, ULID-keyed leak that never mis-signals a later run.
-    fn unregister(&self, task_id: &str) {
-        if let Ok(mut map) = self.inner.lock() {
-            map.remove(task_id);
-        }
+        self.inner.lock().map_or(true, |map| map.keys().any(|(id, _)| id == task_id))
     }
 }
 
@@ -114,8 +113,9 @@ impl CancelRegistry {
 /// [`RunCancelGuard::cancelled`] in its run `select!`; dropping the guard
 /// deregisters the task.
 pub struct RunCancelGuard {
-    task_id: String,
+    key: (String, u64),
     token: CancellationToken,
+    inner: Arc<Mutex<HashMap<(String, u64), CancellationToken>>>,
 }
 
 impl RunCancelGuard {
@@ -128,7 +128,9 @@ impl RunCancelGuard {
 
 impl Drop for RunCancelGuard {
     fn drop(&mut self) {
-        registry().unregister(&self.task_id);
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(&self.key);
+        }
     }
 }
 
@@ -143,7 +145,7 @@ mod tests {
         let reg = CancelRegistry::default();
         // Using the local instance (not the global) keeps the test isolated.
         let token = tokio_util::sync::CancellationToken::new();
-        reg.inner.lock().unwrap().insert("01HZTASK".to_string(), token.clone());
+        reg.inner.lock().unwrap().insert(("01HZTASK".to_string(), 1), token.clone());
 
         assert!(!reg.signal("nope"), "unknown task signals nothing");
         assert!(!token.is_cancelled(), "an unrelated task stays live");
@@ -168,5 +170,29 @@ mod tests {
             !reg.signal("01HZDROPME"),
             "deregistered once the guard dropped"
         );
+    }
+
+    #[test]
+    fn older_guard_drop_preserves_successor_registration() {
+        let reg = CancelRegistry::default();
+        let old = reg.register("reclaimed-task");
+        let successor = reg.register("reclaimed-task");
+        drop(old);
+        assert!(reg.is_live("reclaimed-task"));
+        assert!(reg.signal("reclaimed-task"));
+        assert!(successor.token.is_cancelled());
+        drop(successor);
+        assert!(!reg.is_live("reclaimed-task"));
+    }
+
+    #[test]
+    fn cancellation_signals_all_live_epochs_of_only_the_owned_task() {
+        let reg = CancelRegistry::default();
+        let old = reg.register("overlap");
+        let successor = reg.register("overlap");
+        let unrelated = reg.register("unrelated");
+        assert!(reg.signal("overlap"));
+        assert!(old.token.is_cancelled() && successor.token.is_cancelled());
+        assert!(!unrelated.token.is_cancelled());
     }
 }

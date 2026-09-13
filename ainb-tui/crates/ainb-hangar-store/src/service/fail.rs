@@ -15,7 +15,7 @@ use ainb_hangar_core::task::state::TaskState;
 use serde::Serialize;
 use sqlx::SqlitePool;
 
-use super::finalize::{FinalizeError, FinalizeOutcome, finalize_idempotent};
+use super::finalize::{FinalizeError, FinalizeOutcome, finalize_idempotent, finalize_owned};
 
 /// Why a task failed.
 ///
@@ -171,6 +171,40 @@ impl FailTaskService {
         .await
     }
 
+    /// Apply this worker transition only while its original claim epoch owns the row.
+    ///
+    /// # Errors
+    /// Rejects stale ownership, invalid lifecycle states, and database failures.
+    pub async fn fail_owned(
+        pool: &SqlitePool,
+        task_id: &str,
+        epoch: i64,
+        reason: FailureReason,
+        clock: &dyn HangarClock,
+    ) -> Result<FinalizeOutcome, FinalizeError> {
+        let now = clock.now_ms();
+        let reason_str = reason.as_db_str();
+        finalize_owned(
+            pool,
+            task_id,
+            epoch,
+            TaskState::Failed,
+            &[TaskState::Running, TaskState::Queued],
+            "UPDATE agent_task_queue \
+             SET status = 'failed', failure_reason = ?1, finished_at = ?2 \
+             WHERE id = ?3 AND status IN ('running','queued') AND execution_epoch = ?4 \
+             AND (execution_root_id IS NULL OR EXISTS ( \
+                 SELECT 1 FROM agent_task_queue root \
+                 WHERE root.id = agent_task_queue.execution_root_id \
+                 AND root.execution_owner_task_id = agent_task_queue.id \
+                 AND root.execution_owner_epoch = agent_task_queue.execution_epoch \
+                 AND root.execution_cancelled = 0 AND root.execution_published_task_id IS NULL \
+             ))",
+            move |q| q.bind(reason_str).bind(now).bind(task_id).bind(epoch),
+        )
+        .await
+    }
+
     /// Transition `task_id` to `failed` like [`Self::fail`], additionally
     /// persisting a human-readable `detail` into the `result` column so the
     /// task-detail surface renders WHY the run failed. Legal source states are
@@ -221,6 +255,45 @@ impl FailTaskService {
              SET status = 'failed', failure_reason = ?1, result = ?2, finished_at = ?3 \
              WHERE id = ?4 AND status IN ('running','queued')",
             move |q| q.bind(reason_str).bind(result_json).bind(now).bind(task_id),
+        )
+        .await
+    }
+
+    /// Apply this worker transition only while its original claim epoch owns the row.
+    ///
+    /// # Errors
+    /// Rejects stale ownership, invalid lifecycle states, and database failures.
+    pub async fn fail_with_detail_owned(
+        pool: &SqlitePool,
+        task_id: &str,
+        epoch: i64,
+        reason: FailureReason,
+        detail: &str,
+        clock: &dyn HangarClock,
+    ) -> Result<FinalizeOutcome, FinalizeError> {
+        let now = clock.now_ms();
+        let reason_str = reason.as_db_str();
+        // Persist the diagnostic into `result` in the TaskResult shape so the
+        // task-detail surface renders it (a `content`-only JSON is a legal,
+        // round-tripping TaskResult).
+        let result_json = serde_json::json!({ "content": detail }).to_string();
+        finalize_owned(
+            pool,
+            task_id,
+            epoch,
+            TaskState::Failed,
+            &[TaskState::Running, TaskState::Queued],
+            "UPDATE agent_task_queue \
+             SET status = 'failed', failure_reason = ?1, result = ?2, finished_at = ?3 \
+             WHERE id = ?4 AND status IN ('running','queued') AND execution_epoch = ?5 \
+             AND (execution_root_id IS NULL OR EXISTS ( \
+                 SELECT 1 FROM agent_task_queue root \
+                 WHERE root.id = agent_task_queue.execution_root_id \
+                 AND root.execution_owner_task_id = agent_task_queue.id \
+                 AND root.execution_owner_epoch = agent_task_queue.execution_epoch \
+                 AND root.execution_cancelled = 0 AND root.execution_published_task_id IS NULL \
+             ))",
+            move |q| q.bind(reason_str).bind(result_json).bind(now).bind(task_id).bind(epoch),
         )
         .await
     }
@@ -285,6 +358,45 @@ impl FailTaskService {
              SET status = 'failed', failure_reason = ?1, result = ?2, finished_at = ?3 \
              WHERE id = ?4 AND status = 'dispatched'",
             move |q| q.bind(reason_str).bind(result_json).bind(now).bind(task_id),
+        )
+        .await
+    }
+
+    /// Apply this worker transition only while its original claim epoch owns the row.
+    ///
+    /// # Errors
+    /// Rejects stale ownership, invalid lifecycle states, and database failures.
+    pub async fn fail_setup_owned(
+        pool: &SqlitePool,
+        task_id: &str,
+        epoch: i64,
+        reason: FailureReason,
+        message: &str,
+        clock: &dyn HangarClock,
+    ) -> Result<FinalizeOutcome, FinalizeError> {
+        let now = clock.now_ms();
+        let reason_str = reason.as_db_str();
+        // Persist the real error into `result` in the TaskResult shape so the
+        // task-detail surface renders it (a killed/no-work run's `content`-only
+        // JSON is a legal, round-tripping TaskResult).
+        let result_json = serde_json::json!({ "content": message }).to_string();
+        finalize_owned(
+            pool,
+            task_id,
+            epoch,
+            TaskState::Failed,
+            &[TaskState::Dispatched],
+            "UPDATE agent_task_queue \
+             SET status = 'failed', failure_reason = ?1, result = ?2, finished_at = ?3 \
+             WHERE id = ?4 AND status = 'dispatched' AND execution_epoch = ?5 \
+             AND (execution_root_id IS NULL OR EXISTS ( \
+                 SELECT 1 FROM agent_task_queue root \
+                 WHERE root.id = agent_task_queue.execution_root_id \
+                 AND root.execution_owner_task_id = agent_task_queue.id \
+                 AND root.execution_owner_epoch = agent_task_queue.execution_epoch \
+                 AND root.execution_cancelled = 0 AND root.execution_published_task_id IS NULL \
+             ))",
+            move |q| q.bind(reason_str).bind(result_json).bind(now).bind(task_id).bind(epoch),
         )
         .await
     }

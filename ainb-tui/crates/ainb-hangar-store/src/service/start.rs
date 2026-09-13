@@ -12,7 +12,9 @@ use ainb_hangar_core::clock::HangarClock;
 use ainb_hangar_core::task::state::TaskState;
 use sqlx::SqlitePool;
 
-use super::finalize::{FinalizeError, FinalizeOutcome, finalize_idempotent, record_workspace_id};
+use super::finalize::{
+    FinalizeError, FinalizeOutcome, finalize_idempotent, finalize_owned, record_workspace_id,
+};
 
 /// Stateless `dispatched -> running` service over `agent_task_queue`.
 pub struct StartTaskService;
@@ -49,6 +51,38 @@ impl StartTaskService {
             "UPDATE agent_task_queue SET status = 'running', started_at = ?1 \
              WHERE id = ?2 AND status = 'dispatched'",
             move |q| q.bind(now).bind(task_id),
+        )
+        .await
+    }
+
+    /// Apply this worker transition only while its original claim epoch owns the row.
+    ///
+    /// # Errors
+    /// Rejects stale ownership, invalid lifecycle states, and database failures.
+    pub async fn start_owned(
+        pool: &SqlitePool,
+        task_id: &str,
+        epoch: i64,
+        clock: &dyn HangarClock,
+    ) -> Result<FinalizeOutcome, FinalizeError> {
+        let now = clock.now_ms();
+        record_workspace_id(pool, task_id).await;
+        finalize_owned(
+            pool,
+            task_id,
+            epoch,
+            TaskState::Running,
+            &[TaskState::Dispatched],
+            "UPDATE agent_task_queue SET status = 'running', started_at = ?1 \
+             WHERE id = ?2 AND status = 'dispatched' AND execution_epoch = ?3 \
+             AND (execution_root_id IS NULL OR EXISTS ( \
+                 SELECT 1 FROM agent_task_queue root \
+                 WHERE root.id = agent_task_queue.execution_root_id \
+                 AND root.execution_owner_task_id = agent_task_queue.id \
+                 AND root.execution_owner_epoch = agent_task_queue.execution_epoch \
+                 AND root.execution_cancelled = 0 AND root.execution_published_task_id IS NULL \
+             ))",
+            move |q| q.bind(now).bind(task_id).bind(epoch),
         )
         .await
     }

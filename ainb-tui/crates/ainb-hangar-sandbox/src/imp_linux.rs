@@ -115,7 +115,31 @@ fn landlock_supported() -> bool {
 /// Apply the Landlock ruleset to the calling (forked-child) process. Runs inside
 /// `pre_exec`; returns an `io::Error` on any failure so the spawn fails closed.
 fn apply_landlock(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> std::io::Result<()> {
-    let read_access = AccessFs::from_read(ABI_TARGET);
+    apply_rules(read_roots, write_roots, false)
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn apply_strict_landlock(
+    read_roots: &[PathBuf],
+    write_roots: &[PathBuf],
+) -> std::io::Result<()> {
+    apply_rules(read_roots, write_roots, true)
+}
+
+fn apply_rules(
+    read_roots: &[PathBuf],
+    write_roots: &[PathBuf],
+    strict: bool,
+) -> std::io::Result<()> {
+    // V3 includes TRUNCATE. Accepting a V1 downgrade would leave that operation
+    // outside the selected strict filesystem contract.
+    let abi = if strict { ABI::V3 } else { ABI_TARGET };
+    let compatibility = if strict {
+        CompatLevel::HardRequirement
+    } else {
+        CompatLevel::BestEffort
+    };
+    let read_access = AccessFs::from_read(abi);
     // Write roots grant write WITHOUT read — matching the macOS Seatbelt profile
     // (file-write* on temp, file-read* only on the read roots). Landlock's
     // `from_all` includes `ReadFile`, so without removing it a writable `/tmp`
@@ -123,12 +147,12 @@ fn apply_landlock(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> std::io::R
     // be *readable*, letting the confined agent read any secret another process
     // left under `/tmp`. The task workdir stays fully readable: it is ALSO a read
     // root, and Landlock unions the per-path rules.
-    let mut write_access = AccessFs::from_all(ABI_TARGET);
+    let mut write_access = AccessFs::from_all(abi);
     write_access.remove(AccessFs::ReadFile);
 
     let ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::BestEffort)
-        .handle_access(AccessFs::from_all(ABI_TARGET))
+        .set_compatibility(compatibility)
+        .handle_access(AccessFs::from_all(abi))
         .map_err(to_io)?
         .create()
         .map_err(to_io)?;
@@ -141,14 +165,14 @@ fn apply_landlock(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> std::io::R
             // `Result<_, RulesetError>` item type, so `add_rules` can infer the
             // error type (a re-wrapped `Ok(rule)` leaves it unconstrained → E0283).
             path_beneath_rules(read_roots.iter().map(PathBuf::as_path), read_access)
-                .filter(|r| r.is_ok()),
+                .filter(|r| strict || r.is_ok()),
         )
         .map_err(to_io)?;
 
     let status = ruleset
         .add_rules(
             path_beneath_rules(write_roots.iter().map(PathBuf::as_path), write_access)
-                .filter(|r| r.is_ok()),
+                .filter(|r| strict || r.is_ok()),
         )
         .map_err(to_io)?
         .restrict_self()
@@ -157,8 +181,9 @@ fn apply_landlock(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> std::io::R
     // If the kernel silently failed to enforce, fail closed: better to abort the
     // spawn than to run an agent we believe is sandboxed but is not.
     match status.ruleset {
-        RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced => Ok(()),
-        RulesetStatus::NotEnforced => Err(std::io::Error::other(
+        RulesetStatus::FullyEnforced => Ok(()),
+        RulesetStatus::PartiallyEnforced if !strict => Ok(()),
+        _ => Err(std::io::Error::other(
             "landlock ruleset not enforced by kernel",
         )),
     }

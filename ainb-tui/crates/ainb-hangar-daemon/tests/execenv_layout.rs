@@ -32,6 +32,8 @@ const WS_SLUG: &str = "alpha";
 /// Build a fully-materialised [`Task`] with the fields P1.6 reads.
 fn task_fixture(id: &str, issue_id: Option<&str>) -> Task {
     Task {
+        execution_epoch: 0,
+        execution_limit: None,
         origin: None,
         id: id.to_string(),
         workspace_id: "ws-1".to_string(),

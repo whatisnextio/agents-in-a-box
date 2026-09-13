@@ -1329,6 +1329,7 @@ async fn handle(
         methods::HANGAR_ISSUE_CREATE => handle_issue_create(pool, req, events).await,
         methods::HANGAR_ISSUE_DELETE => handle_issue_delete(pool, req, events).await,
         methods::HANGAR_ISSUE_CANCEL_ACTIVE => handle_issue_cancel_active(pool, req, events).await,
+        methods::HANGAR_TASK_CANCEL => handle_task_cancel(pool, req, events).await,
         methods::HANGAR_ISSUE_UPDATE => handle_issue_update(pool, req, events).await,
         methods::HANGAR_ISSUES_BATCH_UPDATE => handle_issues_batch_update(pool, req, events).await,
         methods::HANGAR_ISSUE_LABEL_ATTACH => handle_issue_label(pool, req, events, true).await,
@@ -7464,6 +7465,103 @@ async fn handle_issue_delete(
 /// pass. An issue with no active task is a clean `{ cancelled: 0 }`, never an error.
 /// On any cancel the card's board placement (if any) is aggregate-auto-moved and
 /// its dependents re-evaluated, matching the card-cancel path.
+/// Cancel a task-only execution through the existing authenticated operator connection.
+/// Task workspace ownership is checked before any state transition or process signal.
+async fn handle_task_cancel(
+    pool: &SqlitePool,
+    req: &RpcRequest,
+    events: &EventSink,
+) -> Result<serde_json::Value, RpcError> {
+    use ainb_hangar_store::repo::task::TaskRepo;
+    use ainb_hangar_store::service::cancel::CancelTaskService;
+    use ainb_hangar_store::service::finalize::{FinalizeError, FinalizeOutcome};
+
+    #[derive(serde::Deserialize)]
+    struct Params {
+        workspace_id: String,
+        task_id: String,
+    }
+    let params: Params = parse_params(req, "{ workspace_id, task_id }")?;
+    let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
+    let task = TaskRepo::get_by_id(pool, &params.task_id)
+        .await
+        .map_err(|e| store_err(&e))?
+        .filter(|task| task.workspace_id == ws.as_str())
+        .ok_or_else(|| invalid_params("task does not belong to that workspace"))?;
+    if task.execution_limit.is_some() {
+        let root_id: String =
+            sqlx::query_scalar("SELECT execution_root_id FROM agent_task_queue WHERE id = ?")
+                .bind(&task.id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| store_err(&e))?;
+        // Logical cancellation is fenced before reading/signalling active children.
+        // Publication wins if committed first; otherwise later claims/results stop.
+        let fenced = sqlx::query(
+            "UPDATE agent_task_queue SET execution_cancelled = 1 \
+             WHERE id = ? AND execution_published_task_id IS NULL",
+        )
+        .bind(&root_id)
+        .execute(pool)
+        .await
+        .map_err(|e| store_err(&e))?
+        .rows_affected();
+        if fenced == 0 {
+            return Ok(
+                serde_json::json!({"task_id": task.id, "cancelled": false, "signalled": false}),
+            );
+        }
+        let active: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM agent_task_queue WHERE execution_root_id = ? \
+             AND status IN ('queued','dispatched','running') ORDER BY id",
+        )
+        .bind(&root_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| store_err(&e))?;
+        let mut signalled = false;
+        for id in active {
+            match CancelTaskService::cancel(pool, &id, &SystemClock).await {
+                Ok(FinalizeOutcome::Transitioned) => {
+                    signalled |= crate::cancel::registry().signal(&id);
+                    if let Some(row) =
+                        TaskRepo::get_by_id(pool, &id).await.map_err(|e| store_err(&e))?
+                    {
+                        crate::run_loop::emit_task_finished(
+                            events,
+                            &row,
+                            ainb_hangar_proto::events::TaskResult::Cancelled,
+                            &SystemClock,
+                        );
+                    }
+                }
+                Ok(FinalizeOutcome::AlreadyTerminal) => {}
+                Err(e) => return Err(store_err(&e)),
+            }
+        }
+        return Ok(
+            serde_json::json!({"task_id": task.id, "cancelled": true, "signalled": signalled}),
+        );
+    }
+    let (cancelled, signalled) = match CancelTaskService::cancel(pool, &task.id, &SystemClock).await
+    {
+        Ok(FinalizeOutcome::Transitioned) => {
+            let signalled = crate::cancel::registry().signal(&task.id);
+            crate::run_loop::emit_task_finished(
+                events,
+                &task,
+                ainb_hangar_proto::events::TaskResult::Cancelled,
+                &SystemClock,
+            );
+            (true, signalled)
+        }
+        Ok(FinalizeOutcome::AlreadyTerminal) => (true, false),
+        Err(FinalizeError::TerminalMismatch { .. }) => (false, false),
+        Err(e) => return Err(store_err(&e)),
+    };
+    Ok(serde_json::json!({"task_id": task.id, "cancelled": cancelled, "signalled": signalled}))
+}
+
 async fn handle_issue_cancel_active(
     pool: &SqlitePool,
     req: &RpcRequest,

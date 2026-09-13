@@ -54,6 +54,10 @@ use sqlx::{Row, SqlitePool};
 pub struct ClaimedTask {
     /// The claimed task's primary key.
     pub id: String,
+    /// Ownership token carried unchanged by this worker.
+    pub execution_epoch: i64,
+    /// Current logical-root allowance, or legacy unrestricted admission.
+    pub execution_limit: Option<i64>,
     /// Agent that will execute the task (`agent.id`).
     pub agent_id: String,
     /// Runtime the task was claimed for (`agent_runtime.id`).
@@ -142,11 +146,17 @@ impl ClaimTaskService {
 /// `?1` = `dispatched_at` (now), `?2` = `runtime_id`.
 const CLAIM_SQL: &str = "\
 UPDATE agent_task_queue \
-SET status = 'dispatched', dispatched_at = ?1 \
+SET status = 'dispatched', dispatched_at = ?1, execution_epoch = execution_epoch + 1 \
 WHERE id = ( \
     SELECT q.id FROM agent_task_queue AS q \
     JOIN agent AS a ON a.id = q.agent_id \
     WHERE q.status = 'queued' AND q.runtime_id = ?2 \
+      AND (q.execution_root_id IS NULL OR EXISTS ( \
+          SELECT 1 FROM agent_task_queue root WHERE root.id = q.execution_root_id \
+          AND root.execution_limit IS NOT NULL AND root.execution_units < root.execution_limit \
+          AND root.execution_owner_task_id IS NULL \
+          AND root.execution_published_task_id IS NULL AND root.execution_cancelled = 0 \
+      )) \
       AND ( \
         SELECT COUNT(*) FROM agent_task_queue AS r \
         WHERE r.agent_id = q.agent_id AND r.status IN ('dispatched','running') \
@@ -161,7 +171,9 @@ WHERE id = ( \
     ORDER BY q.priority DESC, q.created_at, q.id \
     LIMIT 1 \
 ) \
-RETURNING id, workspace_id, agent_id, runtime_id, issue_id, session_id, work_dir, dispatched_at, squad_id";
+RETURNING id, workspace_id, agent_id, runtime_id, issue_id, session_id, work_dir, dispatched_at, squad_id, execution_epoch, \
+    (SELECT root.execution_limit FROM agent_task_queue root \
+     WHERE root.id = agent_task_queue.execution_root_id) AS execution_limit";
 
 /// Decode a [`ClaimedTask`] from the `RETURNING` row of [`CLAIM_SQL`].
 ///
@@ -171,6 +183,8 @@ RETURNING id, workspace_id, agent_id, runtime_id, issue_id, session_id, work_dir
 fn claimed_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ClaimedTask, sqlx::Error> {
     Ok(ClaimedTask {
         id: row.try_get("id")?,
+        execution_epoch: row.try_get("execution_epoch")?,
+        execution_limit: row.try_get("execution_limit")?,
         agent_id: row.try_get("agent_id")?,
         runtime_id: row.try_get("runtime_id")?,
         issue_id: row.try_get("issue_id")?,

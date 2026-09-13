@@ -13,6 +13,9 @@ use ainb_hangar_store::Store;
 
 use crate::run_loop::{DaemonConfig, run};
 
+/// Strict worker process lifetime helper; no task control or persistence.
+pub mod support_supervisor;
+
 /// The daemon-owned ACP agent pool (plan Phase 5): one adapter process per
 /// PROVIDER hosting many sessions, demultiplexed by ACP `sessionId`, plus the
 /// shared [`acp_pool::converge_dirty_session`] routine the boot scan
