@@ -551,6 +551,44 @@ impl AtcInstanceRepo {
         Ok(rows.iter().map(retry_from_sqlite).collect())
     }
 
+    /// Atomically reserve one automatic-continue unit under the CURRENT
+    /// registered cap, returning the exact newly consumed unit.
+    ///
+    /// Missing authority, exhaustion or escalation returns `None` without a
+    /// ledger mutation. The existing cap policy clamps to at least one; enabled
+    /// controls heartbeat scheduling, not the reserved retry-sweep allowance.
+    /// A successful reservation remains spent even if the subsequent send fails.
+    /// This is unit admission, not currency budgeting or effect fencing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`sqlx::Error`] on database failure; callers must not send.
+    pub async fn reserve_continue(
+        pool: &SqlitePool,
+        instance_name: &str,
+        session_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO atc_retry \
+                 (instance_name, session_id, continue_count, escalated, updated_at) \
+             SELECT name, ?2, 1, 0, ?3 FROM atc_instance \
+             WHERE name = ?1 AND max(err_retry_cap, 1) >= 1 \
+             ON CONFLICT(instance_name, session_id) DO UPDATE SET \
+                 continue_count = atc_retry.continue_count + 1, \
+                 updated_at = excluded.updated_at \
+             WHERE atc_retry.escalated = 0 \
+               AND atc_retry.continue_count < \
+                   (SELECT max(err_retry_cap, 1) FROM atc_instance WHERE name = ?1) \
+             RETURNING continue_count",
+        )
+        .bind(instance_name)
+        .bind(session_id)
+        .bind(now_ms)
+        .fetch_optional(pool)
+        .await
+    }
+
     /// Record one auto-`continue` for a session: increment `continue_count` and
     /// return the NEW count. Upserts, so a first continue creates the row.
     ///
