@@ -796,10 +796,8 @@ mod tests {
         let (_dir, store) = store().await;
         let (_broker, sink) = broker();
         seed_err(&store, "claude:cap-change", "/work/cap-change", OVERLOADED).await;
-        let mut snapshot = AtcInstanceRepo::get(store.pool(), SWEEP_INSTANCE)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut snapshot =
+            AtcInstanceRepo::get(store.pool(), SWEEP_INSTANCE).await.unwrap().unwrap();
         snapshot.err_retry_cap = 100;
         AtcInstanceRepo::record_continue(store.pool(), SWEEP_INSTANCE, "claude:cap-change", NOW)
             .await
@@ -830,10 +828,7 @@ mod tests {
         );
         assert_eq!(ledger(&store, "claude:cap-change").await, Some(1));
         assert!(
-            FleetRepo::list_action_receipts(store.pool(), 10)
-                .await
-                .unwrap()
-                .is_empty(),
+            FleetRepo::list_action_receipts(store.pool(), 10).await.unwrap().is_empty(),
             "denied admission must never enter transport"
         );
     }
@@ -854,10 +849,8 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
-        let mut snapshot = AtcInstanceRepo::get(store.pool(), SWEEP_INSTANCE)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut snapshot =
+            AtcInstanceRepo::get(store.pool(), SWEEP_INSTANCE).await.unwrap().unwrap();
         snapshot.err_retry_cap = 100;
         let session = FleetRepo::get_session(store.pool(), "claude:concurrent-cap")
             .await
@@ -900,9 +893,7 @@ mod tests {
             "capability-less fixture retains failed-send units"
         );
         assert_eq!(ledger(&store, "claude:concurrent-cap").await, Some(2));
-        let receipts = FleetRepo::list_action_receipts(store.pool(), 100)
-            .await
-            .unwrap();
+        let receipts = FleetRepo::list_action_receipts(store.pool(), 100).await.unwrap();
         assert_eq!(
             receipts.len(),
             2,
