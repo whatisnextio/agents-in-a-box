@@ -1106,6 +1106,30 @@ fn cancel_rpc(f: &Fixture, workspace: &str, authenticated: bool) -> Value {
 #[test]
 fn support_workflow_cancel_before_publication() {
     let mut f = Fixture::new("cancel_before_publication", "transient", 2);
+    let (foreign_workspace_id, foreign_workspace_resolved_id) = rt().block_on(async {
+        use ainb_hangar_store::repo::workspace::WorkspaceRepo;
+        let store = Store::open_in(&f.hangar()).await.unwrap();
+        let workspace = WorkspaceRepo::create(
+            store.pool(),
+            "foreign-workspace",
+            "Synthetic foreign workspace",
+            None,
+        )
+        .await
+        .unwrap();
+        let typed = ainb_hangar_core::ids::WorkspaceId::from_str(workspace.id.clone()).unwrap();
+        assert!(WorkspaceRepo::get_config(store.pool(), &typed).await.unwrap().is_some());
+        let resolved: String =
+            sqlx::query_scalar("SELECT id FROM workspace WHERE id = ?1 OR slug = ?1 LIMIT 1")
+                .bind("foreign-workspace")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(resolved, workspace.id);
+        assert_ne!(resolved, ainb_hangar_daemon::seed::WS_ID);
+        store.pool().close().await;
+        (workspace.id, resolved)
+    });
     let mut unrelated = OwnedControlProcess(
         Command::new("/bin/sleep")
             .arg("60")
@@ -1134,7 +1158,11 @@ fn support_workflow_cancel_before_publication() {
     let unauth = cancel_rpc(&f, ainb_hangar_daemon::seed::WS_SLUG, false);
     assert!(!unauth["error"].is_null());
     let foreign = cancel_rpc(&f, "foreign-workspace", true);
-    assert!(!foreign["error"].is_null());
+    assert_eq!(foreign["error"]["code"], -32602);
+    assert_eq!(
+        foreign["error"]["message"],
+        "task does not belong to that workspace"
+    );
     assert_eq!(f.task(TASK).status, "running");
     assert!(process_identity(pid).is_some());
     let cancelled = cancel_rpc(&f, ainb_hangar_daemon::seed::WS_SLUG, true);
@@ -1178,6 +1206,9 @@ fn support_workflow_cancel_before_publication() {
     assert!(f.roots_for(child_id).is_empty());
     assert_eq!(f.task(child_id).execution_epoch, 0);
     f.controls = json!({"unauthenticated_response":unauth,"foreign_workspace_response":foreign,"operator_response":cancelled,
+        "foreign_workspace_exists":true,"foreign_workspace_slug":"foreign-workspace",
+        "foreign_workspace_id":foreign_workspace_id,"foreign_workspace_resolved_id":foreign_workspace_resolved_id,
+        "task_workspace_id":f.task(TASK).workspace_id,
         "worker_pid":pid,"worker_stopped_before_fixture_cleanup":true,"old_root":old,"delayed_completion":denial,"cancelled_after_restart":true,
         "remaining_allowance":1,"forced_retry_child":child_id,"forced_retry_after_cancel_denied":true,
         "supervisor_pid":supervisor,"descendant_pid":child_pid,"supervisor_stopped_before_fixture_cleanup":true,
