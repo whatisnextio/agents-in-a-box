@@ -37,6 +37,11 @@
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use std::os::{fd::AsFd, unix::fs::MetadataExt};
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use landlock::PathBeneath;
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, PathFd, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
@@ -115,30 +120,96 @@ fn landlock_supported() -> bool {
 /// Apply the Landlock ruleset to the calling (forked-child) process. Runs inside
 /// `pre_exec`; returns an `io::Error` on any failure so the spawn fails closed.
 fn apply_landlock(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> std::io::Result<()> {
-    apply_rules(read_roots, write_roots, false)
+    apply_rules(read_roots, write_roots)
+}
+
+// Keep the original inode alive until spawn, so deletion/recreation cannot
+// recycle its identity. The rule itself must still reopen the required path:
+// using this retained descriptor alone would hide deletion after build.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) struct RequiredRoot {
+    path: PathBuf,
+    _original_fd: PathFd,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl RequiredRoot {
+    pub(crate) fn new(path: &Path) -> std::io::Result<Self> {
+        let fd = PathFd::new(path).map_err(to_io)?;
+        let metadata = std::fs::File::from(fd.as_fd().try_clone_to_owned()?).metadata()?;
+        if !metadata.is_dir() {
+            return Err(std::io::Error::other("execution root is not a directory"));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            _original_fd: fd,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn apply_strict_landlock(
     read_roots: &[PathBuf],
     write_roots: &[PathBuf],
+    required_root: &RequiredRoot,
 ) -> std::io::Result<()> {
-    apply_rules(read_roots, write_roots, true)
+    if write_roots.len() != 1
+        || write_roots.first() != Some(&required_root.path)
+        || !read_roots.contains(&required_root.path)
+    {
+        return Err(std::io::Error::other(
+            "strict policy must use its bound execution root",
+        ));
+    }
+    let root_fd = PathFd::new(&required_root.path).map_err(to_io)?;
+    let metadata = std::fs::File::from(root_fd.as_fd().try_clone_to_owned()?).metadata()?;
+    if !metadata.is_dir()
+        || metadata.dev() != required_root.device
+        || metadata.ino() != required_root.inode
+    {
+        return Err(std::io::Error::other(
+            "required execution root identity changed",
+        ));
+    }
+    // V3 includes TRUNCATE. Every selected path is mandatory and explicitly
+    // opened: path_beneath_rules silently omits paths it cannot open, even
+    // when the receiving ruleset has HardRequirement compatibility.
+    let abi = ABI::V3;
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(to_io)?
+        .create()
+        .map_err(to_io)?
+        .add_rule(PathBeneath::new(root_fd, AccessFs::from_all(abi)))
+        .map_err(to_io)?;
+    for path in read_roots.iter().filter(|path| *path != &required_root.path) {
+        let fd = PathFd::new(path).map_err(to_io)?;
+        // Derive rights from the object used by the rule, never a second path
+        // lookup whose type could refer to a replacement object.
+        let metadata = std::fs::File::from(fd.as_fd().try_clone_to_owned()?).metadata()?;
+        let mut access = AccessFs::from_read(abi);
+        if !metadata.is_dir() {
+            access &= AccessFs::from_file(abi);
+        }
+        ruleset = ruleset.add_rule(PathBeneath::new(fd, access)).map_err(to_io)?;
+    }
+    let status = ruleset.restrict_self().map_err(to_io)?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => Ok(()),
+        _ => Err(std::io::Error::other(
+            "strict landlock ruleset not fully enforced by kernel",
+        )),
+    }
 }
 
-fn apply_rules(
-    read_roots: &[PathBuf],
-    write_roots: &[PathBuf],
-    strict: bool,
-) -> std::io::Result<()> {
-    // V3 includes TRUNCATE. Accepting a V1 downgrade would leave that operation
-    // outside the selected strict filesystem contract.
-    let abi = if strict { ABI::V3 } else { ABI_TARGET };
-    let compatibility = if strict {
-        CompatLevel::HardRequirement
-    } else {
-        CompatLevel::BestEffort
-    };
+fn apply_rules(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> std::io::Result<()> {
+    let abi = ABI_TARGET;
+    let compatibility = CompatLevel::BestEffort;
     let read_access = AccessFs::from_read(abi);
     // Write roots grant write WITHOUT read — matching the macOS Seatbelt profile
     // (file-write* on temp, file-read* only on the read roots). Landlock's
@@ -165,14 +236,14 @@ fn apply_rules(
             // `Result<_, RulesetError>` item type, so `add_rules` can infer the
             // error type (a re-wrapped `Ok(rule)` leaves it unconstrained → E0283).
             path_beneath_rules(read_roots.iter().map(PathBuf::as_path), read_access)
-                .filter(|r| strict || r.is_ok()),
+                .filter(|r| r.is_ok()),
         )
         .map_err(to_io)?;
 
     let status = ruleset
         .add_rules(
             path_beneath_rules(write_roots.iter().map(PathBuf::as_path), write_access)
-                .filter(|r| strict || r.is_ok()),
+                .filter(|r| r.is_ok()),
         )
         .map_err(to_io)?
         .restrict_self()
@@ -182,7 +253,7 @@ fn apply_rules(
     // spawn than to run an agent we believe is sandboxed but is not.
     match status.ruleset {
         RulesetStatus::FullyEnforced => Ok(()),
-        RulesetStatus::PartiallyEnforced if !strict => Ok(()),
+        RulesetStatus::PartiallyEnforced => Ok(()),
         _ => Err(std::io::Error::other(
             "landlock ruleset not enforced by kernel",
         )),

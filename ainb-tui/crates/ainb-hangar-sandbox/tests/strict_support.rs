@@ -219,8 +219,42 @@ print('strict-network-verified')
             command.command().output().is_err(),
             "missing required root must prevent exec"
         );
+        // Reusing the name must not silently authorise a replacement inode.
+        // The command retains the original inode, preventing identity reuse.
+        fs::create_dir(&epoch).unwrap();
+        assert!(
+            command.command().output().is_err(),
+            "a replacement directory must prevent exec"
+        );
+        fs::remove_dir(&epoch).unwrap();
+        let successor = home.path().join("successor");
+        fs::create_dir(&successor).unwrap();
+        fs::write(successor.join("sentinel"), "owned successor").unwrap();
+        std::os::unix::fs::symlink(&successor, &epoch).unwrap();
+        assert!(
+            command.command().output().is_err(),
+            "a replacement symlink must prevent exec"
+        );
+        assert_eq!(
+            fs::read_to_string(successor.join("sentinel")).unwrap(),
+            "owned successor"
+        );
+        // A newly bound, unchanged root must still start the same program with
+        // full strict enforcement; failures above cannot pass vacuously.
+        let mut positive = strict_support_command(Path::new("/bin/sh"), &successor).unwrap();
+        let output = positive
+            .command()
+            .args(["-c", "printf worker-executed"])
+            .stdout(Stdio::piped())
+            .output()
+            .expect("unchanged required root must allow exec");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"worker-executed");
         // A bare program is viable on this host; the preceding failure is setup.
         assert!(Command::new("/bin/sh").args(["-c", "exit 0"]).status().unwrap().success());
+        println!(
+            "\nstrict-required-root-verified missing=spawn-denied replacement-directory=spawn-denied replacement-symlink=spawn-denied unchanged-root=executed"
+        );
     }
 
     #[test]

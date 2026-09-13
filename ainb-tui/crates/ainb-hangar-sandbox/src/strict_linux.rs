@@ -12,11 +12,7 @@ pub(crate) fn build(
     execution_root: &Path,
 ) -> Result<SandboxedCommand, SandboxError> {
     let root = execution_root.canonicalize()?;
-    if !root.is_dir() {
-        return Err(SandboxError::Unavailable(
-            "execution root is not a directory".into(),
-        ));
-    }
+    let required_root = crate::imp_linux::RequiredRoot::new(&root)?;
     let program = program.canonicalize()?;
     let mut policy = SandboxPolicy::strict_support(&root);
     // Grant the executable, never its parent (which can contain controller DBs
@@ -36,7 +32,11 @@ pub(crate) fn build(
             if libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 4_u32) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            crate::imp_linux::apply_strict_landlock(&policy.read_roots, &policy.write_roots)?;
+            crate::imp_linux::apply_strict_landlock(
+                &policy.read_roots,
+                &policy.write_roots,
+                &required_root,
+            )?;
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
