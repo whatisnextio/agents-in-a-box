@@ -28,7 +28,54 @@ mod linux {
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
     use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    // Hold the actual owned child through every observation and reap on all
+    // paths. No test operation accepts a caller-supplied target PID.
+    struct SignalTarget(std::process::Child);
+
+    impl Drop for SignalTarget {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn signal_target(directory: &Path) -> SignalTarget {
+        fs::create_dir(directory).unwrap();
+        let ready = directory.join("ready");
+        let marker = directory.join("notification");
+        let mut target = SignalTarget(
+            Command::new("/usr/bin/python3")
+                .env_clear()
+                .args([
+                    "-c",
+                    "import signal, sys\ndef notified(*_):\n    with open(sys.argv[2], 'w') as f: f.write('kernel-notification')\nsignal.signal(signal.SIGUSR1, notified)\nwith open(sys.argv[1], 'w') as f: f.write('ready')\nwhile True: signal.pause()",
+                ])
+                .arg(&ready)
+                .arg(&marker)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("fresh namespace-owned signal target must start"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(
+                target.0.try_wait().unwrap().is_none(),
+                "target exited before readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "signal handler readiness timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        target
+    }
 
     fn execute(script: &str, root: &Path, args: &[&Path]) -> std::process::Output {
         let mut command = strict_support_command(Path::new("/usr/bin/python3"), root)
@@ -178,9 +225,147 @@ print('strict-network-verified')
 
     #[test]
     fn strict_support_closes_inherited_fds_and_denies_alternate_syscalls() {
+        const PARENT_NAMESPACE: &str = "HANGAR_STRICT_FCNTL_PARENT_NS";
+        const INNER_PROOF: &str = "owned-namespace-async-controls-verified";
+        let namespace = fs::read_link("/proc/self/ns/pid").unwrap();
+        match std::env::var_os(PARENT_NAMESPACE) {
+            None => {
+                // This one case contains a real, benign kernel notification.
+                // Isolate its fresh owned targets from all host processes.
+                // Missing namespace tooling is a failure, never a skip.
+                let output = Command::new("sudo")
+                    .args([
+                        "-n",
+                        "timeout",
+                        "--signal=KILL",
+                        "30s",
+                        "unshare",
+                        "--pid",
+                        "--fork",
+                        "--mount-proc",
+                        "--kill-child",
+                        "env",
+                        "-i",
+                        "PATH=/usr/bin:/bin",
+                    ])
+                    .arg(format!("{PARENT_NAMESPACE}={}", namespace.display()))
+                    .arg(std::env::current_exe().unwrap().canonicalize().unwrap())
+                    .args([
+                        "--exact",
+                        "linux::strict_support_closes_inherited_fds_and_denies_alternate_syscalls",
+                        "--test-threads=1",
+                        "--nocapture",
+                    ])
+                    .output()
+                    .expect("sudo and a disposable PID namespace are mandatory for this probe");
+                assert!(
+                    output.status.success(),
+                    "nested probe failed: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let proof: Vec<_> =
+                    stdout.lines().filter(|line| line.starts_with(INNER_PROOF)).collect();
+                assert_eq!(
+                    proof.len(),
+                    1,
+                    "nested test must emit exactly one namespace proof"
+                );
+                // Do not replay nested libtest result lines: the outer named
+                // test remains one mandatory case in the frozen runset.
+                println!("\n{}", proof[0]);
+                return;
+            }
+            Some(parent) => assert_ne!(
+                namespace,
+                std::path::PathBuf::from(parent),
+                "notification probe must run in a new PID namespace"
+            ),
+        }
+        assert_eq!(
+            std::process::id(),
+            1,
+            "nested test must own its PID namespace"
+        );
         let home = tempfile::tempdir().unwrap();
         let epoch = home.path().join("epoch");
         fs::create_dir(&epoch).unwrap();
+        let positive_directory = home.path().join("positive-target");
+        let mut positive = signal_target(&positive_directory);
+        let observer_uid = unsafe { libc::geteuid() };
+        let positive_pid = positive.0.id();
+        assert_eq!(
+            fs::metadata(format!("/proc/{positive_pid}")).unwrap().uid(),
+            observer_uid,
+            "positive target must have the observer's UID"
+        );
+        let mut pipe = [-1; 2];
+        // SAFETY: pipe2 returns fresh owned descriptors. The signal target is
+        // our live Child in this private namespace and only handles SIGUSR1.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let read_pipe = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        let write_pipe = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let flags = unsafe { libc::fcntl(read_pipe.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    read_pipe.as_raw_fd(),
+                    libc::F_SETOWN,
+                    positive.0.id() as libc::pid_t,
+                )
+            },
+            0
+        );
+        // F_SETSIG is Linux UAPI command 10 on both supported native ABIs.
+        assert_eq!(
+            unsafe { libc::fcntl(read_pipe.as_raw_fd(), 10, libc::SIGUSR1) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(read_pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_ASYNC) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::write(write_pipe.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+            1
+        );
+        let notification = positive_directory.join("notification");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while fs::read_to_string(&notification).ok().as_deref() != Some("kernel-notification") {
+            assert!(
+                positive.0.try_wait().unwrap().is_none(),
+                "positive target unexpectedly exited"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "unconfined kernel notification did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(&notification).unwrap(),
+            "kernel-notification"
+        );
+        assert!(positive.0.try_wait().unwrap().is_none());
+        assert_eq!(
+            unsafe { libc::fcntl(read_pipe.as_raw_fd(), libc::F_SETFL, flags) },
+            0
+        );
+        drop((read_pipe, write_pipe));
+        drop(positive);
+        let negative_directory = home.path().join("confined-target");
+        let mut negative = signal_target(&negative_directory);
+        let target_pid = negative.0.id();
+        assert_eq!(
+            fs::metadata(format!("/proc/{target_pid}")).unwrap().uid(),
+            observer_uid,
+            "confined target must have the observer's UID"
+        );
         let outside = fs::File::create(home.path().join("controller-state")).unwrap();
         // Deliberately inherit a high descriptor without CLOEXEC. Keeping it
         // above normal interpreter descriptors makes reuse unambiguous.
@@ -220,11 +405,38 @@ print('strict-network-verified')
         ];
         let script = format!(
             r#"
-import os, errno, ctypes, subprocess, sys
+import os, errno, ctypes, subprocess, sys, fcntl, signal, struct
 try: os.fstat({raw})
 except OSError as error: assert error.errno == errno.EBADF
 else: raise AssertionError('inherited controller descriptor survived exec')
 libc = ctypes.CDLL(None, use_errno=True)
+def denied(operation):
+    try: operation()
+    except OSError as error: assert error.errno == errno.EPERM, error
+    else: raise AssertionError('async signal authority escaped confinement')
+r, w = os.pipe()
+# Ordinary fcntl remains useful: descriptor flags, nonblocking status, and dup.
+fd_flags = fcntl.fcntl(r, fcntl.F_GETFD)
+fcntl.fcntl(r, fcntl.F_SETFD, fd_flags | fcntl.FD_CLOEXEC)
+assert fcntl.fcntl(r, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+flags = fcntl.fcntl(r, fcntl.F_GETFL)
+fcntl.fcntl(r, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+assert fcntl.fcntl(r, fcntl.F_GETFL) & os.O_NONBLOCK
+duplicate = fcntl.fcntl(r, fcntl.F_DUPFD, 10)
+os.close(duplicate)
+denied(lambda: fcntl.fcntl(r, fcntl.F_SETOWN, {target_pid}))
+denied(lambda: fcntl.fcntl(r, 15, struct.pack('ii', 1, {target_pid}))) # F_SETOWN_EX / F_OWNER_PID
+denied(lambda: fcntl.fcntl(r, 10, signal.SIGUSR1)) # F_SETSIG
+denied(lambda: fcntl.fcntl(r, fcntl.F_SETFL, flags | os.O_ASYNC))
+directory = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
+denied(lambda: fcntl.fcntl(directory, 1026, 2)) # F_NOTIFY / DN_MODIFY
+lease = os.open('lease-control', os.O_CREAT | os.O_RDWR, 0o600)
+denied(lambda: fcntl.fcntl(lease, 1024, fcntl.F_WRLCK)) # F_SETLEASE
+for command, value in [(0x8901, {target_pid}), (0x8902, {target_pid}), (0x5452, 1)]:
+    denied(lambda: fcntl.ioctl(r, command, struct.pack('i', value)))
+assert os.write(w, b'x') == 1
+assert os.read(r, 1) == b'x'
+for fd in [r, w, directory, lease]: os.close(fd)
 class Header(ctypes.Structure):
     _fields_ = [('version', ctypes.c_uint32), ('pid', ctypes.c_int)]
 class Caps(ctypes.Structure):
@@ -271,6 +483,19 @@ print('strict-alternate-paths-verified')
             String::from_utf8_lossy(&output.stdout).trim(),
             "strict-alternate-paths-verified"
         );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !negative_directory.join("notification").exists(),
+            "confined notification unexpectedly reached owned target"
+        );
+        assert!(
+            negative.0.try_wait().unwrap().is_none(),
+            "confined target must remain alive"
+        );
         drop(inherited);
+        println!(
+            "\n{INNER_PROOF} namespace={} observer_uid={observer_uid} positive_pid={positive_pid} positive_uid={observer_uid} positive_notification=received positive_target=alive confined_target_pid={target_pid} confined_target_uid={observer_uid} confined_commands=EPERM confined_notification=absent confined_target=alive ordinary_fcntl=usable",
+            namespace.display()
+        );
     }
 }

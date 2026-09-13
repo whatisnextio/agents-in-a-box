@@ -7481,6 +7481,11 @@ async fn handle_task_cancel(
         workspace_id: String,
         task_id: String,
     }
+    let cancel_err = |e: FinalizeError| RpcError {
+        code: INTERNAL_ERROR,
+        message: format!("cancel task: {e}"),
+        data: None,
+    };
     let params: Params = parse_params(req, "{ workspace_id, task_id }")?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
     let task = TaskRepo::get_by_id(pool, &params.task_id)
@@ -7536,7 +7541,7 @@ async fn handle_task_cancel(
                     }
                 }
                 Ok(FinalizeOutcome::AlreadyTerminal) => {}
-                Err(e) => return Err(store_err(&e)),
+                Err(e) => return Err(cancel_err(e)),
             }
         }
         return Ok(
@@ -7557,7 +7562,7 @@ async fn handle_task_cancel(
         }
         Ok(FinalizeOutcome::AlreadyTerminal) => (true, false),
         Err(FinalizeError::TerminalMismatch { .. }) => (false, false),
-        Err(e) => return Err(store_err(&e)),
+        Err(e) => return Err(cancel_err(e)),
     };
     Ok(serde_json::json!({"task_id": task.id, "cancelled": cancelled, "signalled": signalled}))
 }

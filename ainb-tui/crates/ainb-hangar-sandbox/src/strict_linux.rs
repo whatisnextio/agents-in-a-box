@@ -156,6 +156,37 @@ fn network_filter() -> Vec<libc::sock_filter> {
     filter.push(jump(JUMP_BITS_SET, NEW_NAMESPACES, 0, 1));
     filter.push(statement(RETURN, DENY));
     filter.push(statement(LOAD_WORD_ABS, 0));
+    // Async descriptor owners/signals are kernel signal-routing authority:
+    // blocking kill(2) alone does not prevent fasync from signalling another
+    // same-UID process. Compare the command's low word, as the kernel does.
+    // Values are Linux UAPI asm-generic/fcntl.h on both supported ABIs.
+    for (syscall, commands) in [
+        (libc::SYS_fcntl, &[8_u32, 15, 10, 1026, 1024][..]),
+        // FIOSETOWN, SIOCSPGRP, FIOASYNC; owner getters remain available.
+        (libc::SYS_ioctl, &[0x8901_u32, 0x8902, 0x5452][..]),
+    ] {
+        filter.push(jump(
+            EQUAL,
+            syscall as u32,
+            0,
+            (commands.len() * 2 + 2) as u8,
+        ));
+        filter.push(statement(LOAD_WORD_ABS, 24)); // argument one: command
+        for command in commands {
+            filter.push(jump(EQUAL, *command, 0, 1));
+            filter.push(statement(RETURN, DENY));
+        }
+        filter.push(statement(LOAD_WORD_ABS, 0));
+    }
+    // Keep ordinary status flag changes (e.g. O_NONBLOCK), but never enable
+    // O_ASYNC, including on a pre-existing stdio open-file description.
+    filter.push(jump(EQUAL, libc::SYS_fcntl as u32, 0, 6));
+    filter.push(statement(LOAD_WORD_ABS, 24));
+    filter.push(jump(EQUAL, libc::F_SETFL as u32, 0, 3));
+    filter.push(statement(LOAD_WORD_ABS, 32)); // argument two: flags
+    filter.push(jump(JUMP_BITS_SET, libc::O_ASYNC as u32, 0, 1));
+    filter.push(statement(RETURN, DENY));
+    filter.push(statement(LOAD_WORD_ABS, 0));
     for syscall in [
         libc::SYS_socket,
         libc::SYS_socketpair,
