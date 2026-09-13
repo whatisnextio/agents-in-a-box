@@ -111,9 +111,40 @@ fn preflight() -> (PathBuf, String, PathBuf) {
     let daemon =
         fs::canonicalize(std::env::var_os("QUALIFICATION_DAEMON_BIN").expect("explicit daemon"))
             .unwrap();
+    let compiled = fs::canonicalize(env!("CARGO_BIN_EXE_ainb-hangar-daemon"))
+        .expect("Cargo-associated test daemon must exist");
     assert_eq!(
-        daemon,
-        fs::canonicalize(env!("CARGO_BIN_EXE_ainb-hangar-daemon")).unwrap()
+        compiled.file_name().and_then(|name| name.to_str()),
+        Some("ainb-hangar-daemon"),
+        "Cargo-associated test daemon must have the expected binary name"
+    );
+    let debug = compiled.parent().expect("Cargo test binary debug directory");
+    assert_eq!(
+        debug.file_name().and_then(|name| name.to_str()),
+        Some("debug"),
+        "Cargo test binary must be built in target/debug"
+    );
+    let target = debug.parent().expect("Cargo test target directory");
+    assert_eq!(
+        target.file_name().and_then(|name| name.to_str()),
+        Some("target"),
+        "Cargo test target must be OUTPUT/target"
+    );
+    let output = target.parent().expect("qualification OUTPUT parent");
+    let runtime_path = output.join("daemon-target/debug/ainb-hangar-daemon");
+    let runtime = fs::canonicalize(&runtime_path)
+        .expect("separately built ordinary daemon must exist under the same OUTPUT");
+    assert_eq!(
+        runtime, runtime_path,
+        "ordinary daemon path must not resolve through a linked fallback"
+    );
+    assert_ne!(
+        daemon, compiled,
+        "runtime daemon must not be Cargo's test-feature binary"
+    );
+    assert_eq!(
+        daemon, runtime,
+        "runtime daemon must be the separate OUTPUT/daemon-target/debug build"
     );
     let digest = std::env::var("QUALIFICATION_DAEMON_SHA256").expect("recorded daemon digest");
     assert_eq!(sha(&daemon), digest);
