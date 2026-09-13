@@ -12,7 +12,7 @@ use ainb_hangar_core::task::state::TaskState;
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use super::finalize::{FinalizeError, FinalizeOutcome, finalize_idempotent};
+use super::finalize::{FinalizeError, FinalizeOutcome, finalize_idempotent, finalize_owned};
 
 /// The successful-completion payload persisted onto the task row.
 #[derive(Debug, Clone)]
@@ -68,6 +68,53 @@ impl CompleteTaskService {
                     .bind(params.work_dir)
                     .bind(now)
                     .bind(task_id)
+            },
+        )
+        .await?;
+        // The terminal state this transition lands in, recorded once known so the
+        // span carries the resolved outcome (`done`) regardless of whether this
+        // call won the transition or replayed an already-done row.
+        tracing::Span::current().record("outcome", TaskState::Done.as_db_str());
+        Ok(outcome)
+    }
+
+    /// Apply this worker transition only while its original claim epoch owns the row.
+    ///
+    /// # Errors
+    /// Rejects stale ownership, invalid lifecycle states, and database failures.
+    pub async fn complete_owned(
+        pool: &SqlitePool,
+        task_id: &str,
+        epoch: i64,
+        params: CompleteParams,
+        clock: &dyn HangarClock,
+    ) -> Result<FinalizeOutcome, FinalizeError> {
+        let now = clock.now_ms();
+        let result_json = serde_json::to_string(&params.result)
+            .map_err(|e| FinalizeError::Db(sqlx::Error::Encode(Box::new(e))))?;
+        let outcome = finalize_owned(
+            pool,
+            task_id,
+            epoch,
+            TaskState::Done,
+            &[TaskState::Running],
+            "UPDATE agent_task_queue \
+             SET status = 'done', result = ?1, session_id = ?2, work_dir = ?3, finished_at = ?4 \
+             WHERE id = ?5 AND status = 'running' AND execution_epoch = ?6 \
+             AND (execution_root_id IS NULL OR EXISTS ( \
+                 SELECT 1 FROM agent_task_queue root \
+                 WHERE root.id = agent_task_queue.execution_root_id \
+                 AND root.execution_owner_task_id = agent_task_queue.id \
+                 AND root.execution_owner_epoch = agent_task_queue.execution_epoch \
+                 AND root.execution_cancelled = 0 AND root.execution_published_task_id IS NULL \
+             ))",
+            move |q| {
+                q.bind(result_json)
+                    .bind(params.session_id)
+                    .bind(params.work_dir)
+                    .bind(now)
+                    .bind(task_id)
+                    .bind(epoch)
             },
         )
         .await?;

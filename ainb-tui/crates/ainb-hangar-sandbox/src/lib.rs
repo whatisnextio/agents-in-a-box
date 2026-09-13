@@ -50,6 +50,11 @@ pub use policy::SandboxPolicy;
 mod imp_linux;
 #[cfg(target_os = "macos")]
 mod imp_macos;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod strict_linux;
 
 /// Whether the OS sandbox is actually enforcing for a built command.
 ///
@@ -167,6 +172,39 @@ pub fn sandboxed_command(
         // Unsupported OS: run unconfined. The caller sees `Enforcement::None`.
         let _ = policy;
         Ok(passthrough(program))
+    }
+}
+
+/// Build the opt-in, offline support-worker boundary.
+///
+/// Requires Linux x86-64/aarch64, fully enforced Landlock V3 and seccomp.
+/// Reads are limited to system roots, the exact executable and execution root;
+/// writes are limited to that root. No ambient temporary-directory grant is
+/// added. Socket operations and cross-process descriptor/memory access are
+/// denied, including for descendants. Capabilities are cleared; namespace,
+/// process-group escape, signal and filesystem metadata mutation APIs are
+/// denied. Non-stdio inherited descriptors close
+/// on exec. The trusted caller must supply pipes/null for stdio and set its
+/// worker temporary-directory variables to `execution_root/tmp` after any
+/// `env_clear`. A missing primitive fails command construction or child spawn;
+/// this API never returns an unconfined fallback.
+pub fn strict_support_command(
+    program: &Path,
+    execution_root: &Path,
+) -> Result<SandboxedCommand, SandboxError> {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        return strict_linux::build(program, execution_root);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (program, execution_root);
+        Err(SandboxError::Unavailable(
+            "strict support confinement requires Linux x86-64 or aarch64".into(),
+        ))
     }
 }
 

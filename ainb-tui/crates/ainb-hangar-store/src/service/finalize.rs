@@ -50,6 +50,20 @@ pub enum FinalizeOutcome {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FinalizeError {
+    /// This task/epoch no longer owns its strict logical execution root.
+    #[error("logical execution ownership revoked for epoch {epoch}")]
+    OwnershipRevoked {
+        /// The rejected worker claim epoch.
+        epoch: i64,
+    },
+    /// A different claim owns the task, including terminal replay.
+    #[error("stale execution epoch: expected {expected}, current {actual}")]
+    StaleExecution {
+        /// Worker's original claim token.
+        expected: i64,
+        /// Current durable ownership epoch.
+        actual: i64,
+    },
     /// `StartTask` was called on a task that is already past `dispatched`
     /// (its own dedicated, friendlier variant of an illegal-state error).
     #[error("task already started (not in a dispatched state)")]
@@ -131,6 +145,65 @@ pub async fn finalize_idempotent<'q>(
     // wants (the loser of a race observes the winner's committed terminal state)
     // and matches the reference `task.go:1010`.
     let current = read_state(pool, task_id).await?;
+    classify_no_op(task_id, target, expected_from, current)
+}
+
+/// Apply worker SQL predicated on its claim epoch, rejecting stale terminal replay.
+pub(crate) async fn finalize_owned<'q>(
+    pool: &SqlitePool,
+    task_id: &str,
+    epoch: i64,
+    target: TaskState,
+    expected_from: &[TaskState],
+    update_sql: &'q str,
+    bind_update: impl FnOnce(
+        sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    )
+        -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+) -> Result<FinalizeOutcome, FinalizeError> {
+    if bind_update(sqlx::query(update_sql)).execute(pool).await?.rows_affected() == 1 {
+        cascade_autopilot_run(pool, task_id, target).await?;
+        return Ok(FinalizeOutcome::Transitioned);
+    }
+    let row = sqlx::query(
+        "SELECT task.status, task.execution_epoch, task.execution_root_id, \
+         root.execution_owner_task_id, root.execution_owner_epoch, \
+         root.execution_cancelled, root.execution_published_task_id \
+         FROM agent_task_queue task LEFT JOIN agent_task_queue root \
+         ON root.id = task.execution_root_id WHERE task.id = ?",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    let current = if let Some(row) = row {
+        let actual: i64 = row.try_get("execution_epoch")?;
+        if actual != epoch {
+            return Err(FinalizeError::StaleExecution {
+                expected: epoch,
+                actual,
+            });
+        }
+        if row.try_get::<Option<String>, _>("execution_root_id")?.is_some() {
+            let owner: Option<String> = row.try_get("execution_owner_task_id")?;
+            let owner_epoch: Option<i64> = row.try_get("execution_owner_epoch")?;
+            let cancelled: Option<i64> = row.try_get("execution_cancelled")?;
+            let published: Option<String> = row.try_get("execution_published_task_id")?;
+            if owner.as_deref() != Some(task_id)
+                || owner_epoch != Some(epoch)
+                || cancelled != Some(0)
+                || published.as_deref().is_some_and(|winner| winner != task_id)
+            {
+                return Err(FinalizeError::OwnershipRevoked { epoch });
+            }
+        }
+        let status: String = row.try_get("status")?;
+        Some(
+            TaskState::from_db_str(&status)
+                .map_err(|e| FinalizeError::Db(sqlx::Error::Decode(Box::new(e))))?,
+        )
+    } else {
+        None
+    };
     classify_no_op(task_id, target, expected_from, current)
 }
 

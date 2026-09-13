@@ -392,6 +392,9 @@ pub const HANGAR_ISSUE_DELETE: &str = "hangar/issue_delete";
 /// workspace-scoped, mirroring [`HANGAR_ISSUE_DELETE`]. An issue with no active
 /// task is a clean `{ cancelled: 0 }`, never an error.
 pub const HANGAR_ISSUE_CANCEL_ACTIVE: &str = "hangar/issue_cancel_active";
+
+/// Cancel one owned task without requiring an issue or board. Operator-authenticated.
+pub const HANGAR_TASK_CANCEL: &str = "hangar/task_cancel";
 /// Fetch canonical Fleet snapshot and revision head.
 pub const FLEET_SNAPSHOT: &str = "fleet/snapshot";
 /// Negotiate Fleet protocol version and capability catalogue.
@@ -1813,6 +1816,7 @@ pub const ALL_METHODS: &[&str] = &[
     HANGAR_ISSUE_DELETE,
     // Issue-scoped cancel-active (board-less cancel-and-delete), likewise appended.
     HANGAR_ISSUE_CANCEL_ACTIVE,
+    HANGAR_TASK_CANCEL,
     // Agent delete (Agents screen `x` remove) is APPENDED at the catalogue tail —
     // append-only wire.
     HANGAR_AGENT_DELETE,
@@ -2150,6 +2154,7 @@ mod tests {
             HANGAR_DAEMON_CONFIG_LIST,
             HANGAR_ISSUE_DELETE,
             HANGAR_ISSUE_CANCEL_ACTIVE,
+            HANGAR_TASK_CANCEL,
             HANGAR_ISSUE_LINK_ADD,
             HANGAR_ISSUE_LINK_REMOVE,
             HANGAR_ISSUE_LINKS,

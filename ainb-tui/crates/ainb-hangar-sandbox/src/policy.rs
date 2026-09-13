@@ -76,6 +76,43 @@ const SYSTEM_READ_ROOTS: &[&str] = &[
 ];
 
 impl SandboxPolicy {
+    /// Offline support execution: no ancestor temporary-directory permission.
+    /// Enforcement is supplied by `strict_support_command`, not the legacy
+    /// platform dispatcher (whose Linux network flag remains advisory).
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn strict_support(execution_root: &Path) -> Self {
+        // This offline profile does not need DNS, TLS, passwd or host config.
+        // In particular, /etc as a directory would expose root-readable secrets
+        // when a privileged controller launches the worker.
+        let mut read_roots: Vec<PathBuf> = [
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/etc/ld.so.cache",
+            "/etc/localtime",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+        read_roots.push(execution_root.to_path_buf());
+        Self {
+            read_roots,
+            write_roots: vec![execution_root.to_path_buf()],
+            allow_network: false,
+            disabled: false,
+        }
+    }
+
     /// Build the default confinement policy for a task whose isolated root is
     /// `task_root` (the dir containing `workdir/`, `output/`, `logs/`).
     ///

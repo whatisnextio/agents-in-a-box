@@ -177,9 +177,8 @@ impl<T> AbortOnDrop<T> {
         Self(Some(handle))
     }
 
-    /// Take the handle back, disarming the abort (the normal completion path).
-    fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
-        self.0.take().expect("the handle is taken exactly once")
+    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        self.0.as_mut().expect("the reader handle remains owned").await
     }
 }
 
@@ -887,6 +886,9 @@ pub struct Runner {
     /// to a task (the daemon-wide one the claim loop clones per run, and every
     /// test harness). See [`Self::with_task_stream`].
     stream: Option<RunStream>,
+    // Selected local-result contract; never weakened by the legacy sandbox override.
+    strict_support: bool,
+    support_supervisor: Option<PathBuf>,
 }
 
 impl Provider for Runner {
@@ -899,7 +901,12 @@ impl Runner {
     /// Construct a runner from its static [`RunnerConfig`].
     #[must_use]
     pub const fn new(cfg: RunnerConfig) -> Self {
-        Self { cfg, stream: None }
+        Self {
+            cfg,
+            stream: None,
+            strict_support: false,
+            support_supervisor: None,
+        }
     }
 
     /// This runner, bound to one task's live transcript stream (track A step A2).
@@ -917,6 +924,8 @@ impl Runner {
         Self {
             cfg: self.cfg.clone(),
             stream: RunStream::bind(events, workspace_id, task_id),
+            strict_support: self.strict_support,
+            support_supervisor: self.support_supervisor.clone(),
         }
     }
 
@@ -926,6 +935,25 @@ impl Runner {
     #[must_use]
     pub const fn max_runtime(&self) -> Duration {
         self.cfg.max_runtime
+    }
+
+    /// Select the strict local-result worker boundary for this one run.
+    /// Unsupported confinement is a spawn error, even when legacy sandboxing is disabled.
+    #[must_use]
+    pub fn with_strict_support(&self) -> Self {
+        let mut selected = self.clone();
+        selected.strict_support = true;
+        selected
+    }
+
+    /// Select the reviewed daemon binary when the runner is embedded in a test
+    /// or another executable. Strict mode otherwise requires the daemon's own
+    /// current executable; a missing helper never falls back to a raw worker.
+    #[must_use]
+    pub fn with_support_supervisor(&self, binary: &Path) -> Self {
+        let mut selected = self.clone();
+        selected.support_supervisor = Some(binary.to_path_buf());
+        selected
     }
 
     /// Build the (tokio) spawn command for `program`, wrapped in the OS-level FS
@@ -967,6 +995,21 @@ impl Runner {
         env: &ExecEnv,
         extra_root: Option<&Path>,
     ) -> std::io::Result<Command> {
+        if self.strict_support {
+            if extra_root.is_some() {
+                return Err(std::io::Error::other(
+                    "strict support cannot grant an external workdir",
+                ));
+            }
+            let binary = self.support_supervisor.clone().map_or_else(std::env::current_exe, Ok)?;
+            return crate::support_supervisor::command(
+                &binary,
+                env.root(),
+                program,
+                self.cfg.max_runtime,
+            )
+            .map(Command::from);
+        }
         if !self.cfg.sandbox {
             let cmd = ainb_hangar_sandbox::SandboxedCommand::passthrough(program).into_inner();
             return Ok(Command::from(cmd));
@@ -1682,7 +1725,28 @@ impl Runner {
         I: IntoIterator<Item = (String, String)>,
         E: IntoIterator<Item = (String, String)>,
     {
-        let child_env = compose_child_env(source_env, extra_env);
+        let mut child_env = compose_child_env(source_env, extra_env);
+        if self.strict_support {
+            let root = env.root().canonicalize()?;
+            if !location.cwd.canonicalize()?.starts_with(&root) || location.extra_root.is_some() {
+                return Err(std::io::Error::other(
+                    "strict support cwd is outside its execution root",
+                ));
+            }
+            let private_temp = root.join("tmp");
+            let private_home = root.join("home");
+            std::fs::create_dir_all(&private_temp)?;
+            std::fs::create_dir_all(&private_home)?;
+            child_env.retain(|(key, _)| {
+                matches!(key.as_str(), "PATH" | "LANG" | "LC_ALL")
+                    || key == ORIGIN_TYPE_ENV
+                    || key == ORIGIN_ID_ENV
+            });
+            child_env.push(("HOME".into(), private_home.to_string_lossy().into_owned()));
+            for key in ["TMPDIR", "TMP", "TEMP"] {
+                child_env.push((key.into(), private_temp.to_string_lossy().into_owned()));
+            }
+        }
 
         // hangar-e2e-6 observability: record WHAT is about to spawn — the
         // RESOLVED provider binary, the cwd, and the child-env KEY SET — before
@@ -1756,6 +1820,11 @@ impl Runner {
         // before we move `child` into the wait so a timeout can `killpg` the
         // whole group.
         let pgid = child.id().map(i32::try_from).and_then(Result::ok);
+        let mut group_guard = OwnedProcessGroup {
+            pgid,
+            armed: self.strict_support,
+        };
+        let execution_deadline = tokio::time::Instant::now() + self.cfg.max_runtime;
 
         let stdout = child
             .stdout
@@ -1782,40 +1851,85 @@ impl Runner {
         // cut where the abort lands instead of at EOF; that path is an OS-level
         // wait fault, where the run is failing anyway and a truncated log beats a
         // reader still writing to a finalised task's file.
-        let stdout_task = AbortOnDrop::new(tokio::spawn(async move {
+        let mut stdout_task = AbortOnDrop::new(tokio::spawn(async move {
             stream_stdout(stdout, log_file, tail_lines, stream).await
         }));
-        let stderr_task = tokio::spawn(async move { tail_reader(stderr, tail_lines).await });
+        let mut stderr_task = AbortOnDrop::new(tokio::spawn(async move {
+            tail_reader(stderr, tail_lines).await
+        }));
 
-        let timed_out = match tokio::time::timeout(self.cfg.max_runtime, child.wait()).await {
+        let timed_out = match tokio::time::timeout_at(execution_deadline, child.wait()).await {
             Ok(status) => {
                 status?;
+                // The strict supervisor returns only after ECHILD: its group
+                // no longer has members. Never signal this reaped/reusable PGID.
+                if self.strict_support {
+                    group_guard.armed = false;
+                }
                 false
             }
-            Err(_elapsed) => {
-                // Deadline blown: SIGKILL the whole process group so any
-                // grandchild (e.g. a `sleep` under `sh -c`) dies too and
-                // releases the stdout pipe, then reap the immediate child so no
-                // zombie outlives the run.
-                kill_group(pgid);
+            Err(_) => {
+                if !self.strict_support || group_guard.armed {
+                    kill_group(pgid);
+                }
+                group_guard.armed = false;
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
                 true
             }
         };
-
+        // The original deadline covers pipe draining too: a parent exit does
+        // not imply that descendants have stopped or closed their inherited pipes.
+        let drain_deadline = if timed_out {
+            tokio::time::Instant::now() + Duration::from_secs(2)
+        } else {
+            execution_deadline
+        };
+        let captures = tokio::time::timeout_at(drain_deadline, async {
+            let stdout = stdout_task
+                .join()
+                .await
+                .map_err(|e| std::io::Error::other(format!("stdout task join: {e}")))??;
+            let stderr = stderr_task
+                .join()
+                .await
+                .map_err(|e| std::io::Error::other(format!("stderr task join: {e}")))??;
+            Ok::<_, std::io::Error>((stdout, stderr))
+        })
+        .await;
+        let (timed_out, capture, stderr_tail) = match captures {
+            Ok(captures) => {
+                let (capture, stderr) = captures?;
+                (timed_out, capture, stderr)
+            }
+            Err(_) => {
+                if !self.strict_support || group_guard.armed {
+                    kill_group(pgid);
+                }
+                group_guard.armed = false;
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                // Raw partial stdout was already teed to the owned log. Readers
+                // remain abort-on-drop; unavailable parsed tails are not invented.
+                (
+                    true,
+                    StreamCapture {
+                        session_id: None,
+                        usage: None,
+                        terminal: None,
+                        stdout_tail: String::new(),
+                    },
+                    String::new(),
+                )
+            }
+        };
+        group_guard.armed = false;
         let StreamCapture {
             session_id,
             usage,
             terminal,
             stdout_tail,
-        } = stdout_task
-            .into_inner()
-            .await
-            .map_err(|e| std::io::Error::other(format!("stdout task join: {e}")))??;
-        let stderr_tail = stderr_task
-            .await
-            .map_err(|e| std::io::Error::other(format!("stderr task join: {e}")))??;
+        } = capture;
 
         // `child.wait()` already completed above, so the status is reflected by
         // whether we timed out; re-derive the exit code from the killed/clean
@@ -1826,6 +1940,11 @@ impl Runner {
         } else {
             child.try_wait()?.and_then(|s| s.code())
         };
+        if self.strict_support && exit_code == Some(crate::support_supervisor::SETUP_FAILURE) {
+            return Err(std::io::Error::other(format!(
+                "strict support supervisor setup failed: {stderr_tail}"
+            )));
+        }
 
         let result = RunnerResult {
             exit_code,
@@ -2201,6 +2320,20 @@ fn join_tail(tail: std::collections::VecDeque<String>) -> String {
 /// The child was spawned with `process_group(0)`, so its pid is also its pgid;
 /// `killpg(-pgid)` reaches the provider and every grandchild it spawned. A
 /// best-effort send: an `ESRCH` (group already gone) is ignored. `None` pgid
+/// The strict selected profile cannot create another session/process group.
+/// Drop therefore stops the owned group when its provider future is cancelled.
+struct OwnedProcessGroup {
+    pgid: Option<i32>,
+    armed: bool,
+}
+impl Drop for OwnedProcessGroup {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_group(self.pgid);
+        }
+    }
+}
+
 /// means the child never started.
 fn kill_group(pgid: Option<i32>) {
     let Some(pid) = pgid else { return };

@@ -245,8 +245,31 @@ pub fn prepare_env(
     home: &Path,
     clock: &dyn HangarClock,
 ) -> io::Result<ExecEnv> {
-    let root = task_root(home, ws_slug, &task.id);
+    prepare_env_at(task, task_root(home, ws_slug, &task.id), clock)
+}
 
+/// Materialise a private execution tree for the exact claimed ownership epoch.
+/// A re-claimed task gets a distinct root; never derive the epoch from a later task read.
+pub fn prepare_env_for_execution(
+    task: &Task,
+    ws_slug: &str,
+    home: &Path,
+    execution_epoch: i64,
+    clock: &dyn HangarClock,
+) -> io::Result<ExecEnv> {
+    if execution_epoch <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "execution epoch must be positive",
+        ));
+    }
+    let root = task_root(home, ws_slug, &task.id)
+        .join("executions")
+        .join(execution_epoch.to_string());
+    prepare_env_at(task, root, clock)
+}
+
+fn prepare_env_at(task: &Task, root: PathBuf, clock: &dyn HangarClock) -> io::Result<ExecEnv> {
     let env = ExecEnv {
         workdir: root.join("workdir"),
         output: root.join("output"),

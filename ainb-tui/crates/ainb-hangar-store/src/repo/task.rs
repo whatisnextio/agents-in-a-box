@@ -77,6 +77,10 @@ pub struct NewTask {
 pub struct Task {
     /// Primary key.
     pub id: String,
+    /// Current ownership epoch; worker writes must use the original claim.
+    pub execution_epoch: i64,
+    /// Current allowance on the logical execution root.
+    pub execution_limit: Option<i64>,
     /// Owning workspace.
     pub workspace_id: String,
     /// Target runtime.
@@ -172,6 +176,29 @@ pub struct Task {
 pub struct TaskRepo;
 
 impl TaskRepo {
+    /// Configure a never-claimed root's durable allowance. Cannot replenish a
+    /// spent allowance, disable strict admission, or configure a retry child.
+    ///
+    /// # Errors
+    /// Returns a database error; invalid/non-configurable tasks return false.
+    pub async fn configure_execution_limit(
+        pool: &SqlitePool,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let changed = sqlx::query(
+            "UPDATE agent_task_queue SET execution_limit = ?1, execution_root_id = id \
+             WHERE id = ?2 AND status = 'queued' AND parent_task_id IS NULL \
+             AND execution_epoch = 0 AND execution_units = 0 AND ?1 > 0 \
+             AND NOT EXISTS (SELECT 1 FROM agent_task_queue child WHERE child.parent_task_id = ?2)",
+        )
+        .bind(limit)
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+        Ok(changed.rows_affected() == 1)
+    }
+
     /// Stamp a task's ORIGIN PROVENANCE (migration 0056) WITHIN an enqueue
     /// transaction — same atomicity contract as
     /// [`CardParityRepo::set_task_source_branch_in_tx`]: the claim loop can
@@ -825,12 +852,16 @@ const COLUMNS: &str = "id, workspace_id, runtime_id, agent_id, issue_id, status,
      session_id, work_dir, attempt, max_attempts, parent_task_id, failure_reason, \
      priority, created_at, dispatched_at, started_at, finished_at, autopilot_run_id, \
      mode, session_name, repo_ref, agent_kind, branch, generation, source_branch, squad_id, \
-     origin_type, origin_id";
+     origin_type, origin_id, execution_epoch, \
+     (SELECT root.execution_limit FROM agent_task_queue root \
+      WHERE root.id = agent_task_queue.execution_root_id) AS execution_limit";
 
 /// Map one raw `agent_task_queue` row into a [`Task`].
 fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Task, sqlx::Error> {
     Ok(Task {
         id: row.try_get("id")?,
+        execution_epoch: row.try_get("execution_epoch")?,
+        execution_limit: row.try_get("execution_limit")?,
         workspace_id: row.try_get("workspace_id")?,
         runtime_id: row.try_get("runtime_id")?,
         agent_id: row.try_get("agent_id")?,
