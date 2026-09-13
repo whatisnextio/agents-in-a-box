@@ -1196,11 +1196,15 @@ fn support_workflow_cancel_before_publication() {
     );
     assert_eq!(f.task(TASK).status, "running");
     assert!(process_identity(pid).is_some());
+    // Observe the whole authenticated request and group stop, not only time
+    // after the response has already signalled the worker.
+    let cancellation_started = Instant::now();
     let cancelled = cancel_rpc(&f, ainb_hangar_daemon::seed::WS_SLUG, true);
     assert!(cancelled["error"].is_null(), "{cancelled}");
     assert_eq!(cancelled["result"]["cancelled"], true);
     assert_eq!(cancelled["result"]["signalled"], true);
-    let stopped_elapsed_ms = stopped_within(&[pid, child_pid, supervisor], Instant::now(), 3_000);
+    let stopped_elapsed_ms =
+        stopped_within(&[pid, child_pid, supervisor], cancellation_started, 3_000);
     assert_eq!(
         process_identity(unrelated_pid).as_deref(),
         Some(unrelated_identity.as_str())
