@@ -532,4 +532,285 @@ print('strict-alternate-paths-verified')
             namespace.display()
         );
     }
+
+    #[test]
+    fn strict_support_denies_peer_resource_limits() {
+        const PARENT_NAMESPACE: &str = "HANGAR_STRICT_RESOURCE_PARENT_NS";
+        const PROOF: &str = "owned-namespace-peer-resource-controls-verified";
+        let namespace = fs::read_link("/proc/self/ns/pid").unwrap();
+        match std::env::var_os(PARENT_NAMESPACE) {
+            None => {
+                let output = Command::new("sudo")
+                    .args([
+                        "-n",
+                        "timeout",
+                        "--signal=KILL",
+                        "30s",
+                        "unshare",
+                        "--pid",
+                        "--fork",
+                        "--mount-proc",
+                        "--kill-child",
+                        "env",
+                        "-i",
+                        "PATH=/usr/bin:/bin",
+                    ])
+                    .arg(format!("{PARENT_NAMESPACE}={}", namespace.display()))
+                    .arg(std::env::current_exe().unwrap().canonicalize().unwrap())
+                    .args([
+                        "--exact",
+                        "linux::strict_support_denies_peer_resource_limits",
+                        "--test-threads=1",
+                        "--nocapture",
+                    ])
+                    .output()
+                    .expect("owned PID namespace tooling is mandatory for peer-resource probe");
+                assert!(
+                    output.status.success(),
+                    "nested peer-resource probe failed: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert_eq!(
+                    stdout
+                        .lines()
+                        .filter(|line| line.starts_with(PROOF))
+                        .count(),
+                    1
+                );
+                // Retain actual native/parent observations, without duplicating
+                // the nested libtest names or result count in the outer suite.
+                for line in stdout.lines().filter(|line| {
+                    line.starts_with(PROOF)
+                        || line.starts_with("RESOURCE_NATIVE ")
+                        || line.starts_with("RESOURCE_OBSERVER ")
+                }) {
+                    println!("\n{line}");
+                }
+                return;
+            }
+            Some(parent) => assert_ne!(
+                namespace,
+                std::path::PathBuf::from(parent),
+                "peer-resource probe requires a fresh PID namespace"
+            ),
+        }
+        assert_eq!(std::process::id(), 1, "test must own its PID namespace");
+
+        struct ResourceTarget(std::process::Child);
+        impl Drop for ResourceTarget {
+            fn drop(&mut self) {
+                // Ordinary owned-child teardown only, after observations or on
+                // assertion failure. No signal operation forms part of the probe.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        fn observed_limits(target: &ResourceTarget) -> (u64, u64) {
+            let mut limits = libc::rlimit64 {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: PID comes only from our held live Child. This call queries
+            // its limit and never supplies a replacement limit.
+            assert_eq!(
+                unsafe {
+                    libc::prlimit64(
+                        libc::pid_t::try_from(target.0.id()).unwrap(),
+                        libc::RLIMIT_NOFILE,
+                        std::ptr::null(),
+                        &raw mut limits,
+                    )
+                },
+                0,
+                "parent must query its owned target"
+            );
+            (limits.rlim_cur, limits.rlim_max)
+        }
+        let home = tempfile::tempdir().unwrap();
+        let epoch = home.path().join("epoch");
+        fs::create_dir(&epoch).unwrap();
+        let mut uids = [0; 3];
+        let mut gids = [0; 3];
+        // SAFETY: writable arrays contain exactly the three output identities.
+        assert_eq!(
+            unsafe { libc::getresuid(&raw mut uids[0], &raw mut uids[1], &raw mut uids[2]) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::getresgid(&raw mut gids[0], &raw mut gids[1], &raw mut gids[2]) },
+            0
+        );
+        assert!(uids.iter().all(|value| *value == uids[0]));
+        assert!(gids.iter().all(|value| *value == gids[0]));
+        let mut targets = Vec::new();
+        for name in ["positive", "confined"] {
+            let ready = home.path().join(format!("{name}-ready"));
+            let mut target = ResourceTarget(
+                Command::new("/usr/bin/python3")
+                    .env_clear()
+                    .args([
+                        "-c",
+                        r#"
+import os, resource, sys, time
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+values = [os.getpid(), *os.getresuid(), *os.getresgid(), soft, hard]
+with open(sys.argv[1] + '.pending', 'x') as f:
+    f.write(' '.join(str((1 << 64) - 1 if value == -1 else value) for value in values))
+os.rename(sys.argv[1] + '.pending', sys.argv[1])
+while True: time.sleep(1)
+"#,
+                    ])
+                    .arg(&ready)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("fresh owned resource target must start"),
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() {
+                assert!(
+                    target.0.try_wait().unwrap().is_none(),
+                    "target exited before readiness"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "owned target readiness timed out"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let values: Vec<u64> = fs::read_to_string(&ready)
+                .unwrap()
+                .split_whitespace()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            assert_eq!(values.len(), 9);
+            assert_eq!(values[0], u64::from(target.0.id()));
+            assert_eq!(values[1..4], uids.map(u64::from));
+            assert_eq!(values[4..7], gids.map(u64::from));
+            assert_eq!(
+                fs::read_link(format!("/proc/{}/ns/pid", target.0.id())).unwrap(),
+                namespace
+            );
+            assert_eq!(observed_limits(&target), (values[7], values[8]));
+            assert!(values[7] >= 64, "minimum safe initial soft NOFILE is 64");
+            assert!(target.0.try_wait().unwrap().is_none());
+            targets.push(target);
+        }
+        assert_ne!(targets[0].0.id(), targets[1].0.id());
+        // The same script executes in both modes. It records the actual syscall
+        // result even when confinement fails, so the parent can retain and
+        // independently compare the target's limits before its denial assertion.
+        const NATIVE: &str = r#"
+import ctypes, errno, os, resource, sys
+libc = ctypes.CDLL(None, use_errno=True)
+class Header(ctypes.Structure):
+    _fields_ = [('version', ctypes.c_uint32), ('pid', ctypes.c_int)]
+class Caps(ctypes.Structure):
+    _fields_ = [('effective', ctypes.c_uint32), ('permitted', ctypes.c_uint32), ('inheritable', ctypes.c_uint32)]
+class Limit(ctypes.Structure):
+    _fields_ = [('soft', ctypes.c_uint64), ('hard', ctypes.c_uint64)]
+assert libc.prctl(47, 4, 0, 0, 0) == 0, 'ambient clear failed'
+header = Header(0x20080522, 0)
+caps = (Caps * 2)()
+assert libc.capset(ctypes.byref(header), caps) == 0, 'capability clear failed'
+assert libc.capget(ctypes.byref(header), caps) == 0
+assert all(c.effective == c.permitted == c.inheritable == 0 for c in caps)
+for capability in range(64):
+    ctypes.set_errno(0)
+    state = libc.prctl(47, 1, capability, 0, 0)
+    assert state == 0 or (state == -1 and ctypes.get_errno() == errno.EINVAL), 'ambient capability remains'
+libc.prlimit64.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(Limit), ctypes.POINTER(Limit)]
+libc.prlimit64.restype = ctypes.c_int
+self_limit = Limit()
+assert libc.prlimit64(0, resource.RLIMIT_NOFILE, None, ctypes.byref(self_limit)) == 0, 'self query failed'
+pid, soft, hard = map(int, sys.argv[1:])
+assert pid > 1 and pid != os.getpid() and soft >= 64
+replacement = Limit(soft - 1, hard)
+old = Limit()
+ctypes.set_errno(0)
+result = libc.prlimit64(pid, resource.RLIMIT_NOFILE, ctypes.byref(replacement), ctypes.byref(old))
+error = ctypes.get_errno()
+print('RESOURCE_NATIVE', os.getpid(), *os.getresuid(), *os.getresgid(), self_limit.soft, self_limit.hard,
+      result, error, old.soft, old.hard, 'caps=zero', 'ambient=zero', 'self=usable', flush=True)
+"#;
+        for (index, target) in targets.iter_mut().enumerate() {
+            let before = observed_limits(target);
+            let arguments = [
+                target.0.id().to_string(),
+                before.0.to_string(),
+                before.1.to_string(),
+            ];
+            let output = if index == 0 {
+                Command::new("/usr/bin/python3")
+                    .env_clear()
+                    .arg("-c")
+                    .arg(NATIVE)
+                    .args(&arguments)
+                    .current_dir(&epoch)
+                    .stdin(Stdio::null())
+                    .output()
+                    .expect("unconfined native positive probe must execute")
+            } else {
+                let paths: Vec<_> = arguments.iter().map(Path::new).collect();
+                execute(NATIVE, &epoch, &paths)
+            };
+            println!("\n{}", String::from_utf8_lossy(&output.stdout).trim_end());
+            assert!(
+                output.status.success(),
+                "native probe failed before observation: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let fields: Vec<_> = stdout.split_whitespace().collect();
+            assert_eq!(fields.len(), 17, "native probe observation shape");
+            assert_eq!(fields[0], "RESOURCE_NATIVE");
+            assert_eq!(&fields[14..], &["caps=zero", "ambient=zero", "self=usable"]);
+            let values: Vec<i128> = fields[1..14]
+                .iter()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            assert_eq!(values[1..4], uids.map(i128::from));
+            assert_eq!(values[4..7], gids.map(i128::from));
+            let after = observed_limits(target);
+            let alive = target.0.try_wait().unwrap().is_none();
+            println!(
+                "\nRESOURCE_OBSERVER mode={} target={} before_soft={} before_hard={} after_soft={} after_hard={} target_alive={alive}",
+                if index == 0 { "unconfined" } else { "strict" },
+                target.0.id(),
+                before.0,
+                before.1,
+                after.0,
+                after.1
+            );
+            assert!(alive, "owned target must remain alive");
+            if index == 0 {
+                assert_eq!(
+                    (values[9], values[10]),
+                    (0, 0),
+                    "same-identity capability-free positive must succeed"
+                );
+                assert_eq!(
+                    (values[11], values[12]),
+                    (i128::from(before.0), i128::from(before.1))
+                );
+                assert_eq!(after, (before.0 - 1, before.1));
+            } else {
+                assert_eq!(
+                    (values[9], values[10]),
+                    (-1, i128::from(libc::EPERM)),
+                    "strict worker must deny peer RLIMIT_NOFILE mutation"
+                );
+                assert_eq!(after, before, "strict peer limit must remain unchanged");
+            }
+        }
+        println!(
+            "\n{PROOF} namespace={} uid={} gid={} positive=soft-lowered-one hard=unchanged strict=EPERM targets=alive self=usable",
+            namespace.display(),
+            uids[0],
+            gids[0]
+        );
+    }
 }
